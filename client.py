@@ -24,7 +24,19 @@ class KubemedicEnv(
         return action.model_dump()
 
     def _parse_result(self, payload: Dict) -> StepResult[KubemedicObservation]:
-        observation = KubemedicObservation.model_validate(payload)
+        observation_payload = payload.get("observation", payload)
+        if not isinstance(observation_payload, dict):
+            observation_payload = {}
+
+        merged_payload = dict(observation_payload)
+        if "reward" not in merged_payload and "reward" in payload:
+            merged_payload["reward"] = payload.get("reward")
+        if "done" not in merged_payload and "done" in payload:
+            merged_payload["done"] = payload.get("done")
+        if "metadata" not in merged_payload and "metadata" in payload:
+            merged_payload["metadata"] = payload.get("metadata")
+
+        observation = KubemedicObservation.model_validate(merged_payload)
 
         return StepResult(
             observation=observation,
