@@ -4,24 +4,63 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""
-Data models for the Kubemedic Environment.
+"""Client-facing data models for the Kubemedic environment."""
 
-The Kubemedic environment is a simple test environment that echoes back messages.
-"""
+from __future__ import annotations
+
+from typing import Any, Literal
 
 from openenv.core.env_server.types import Action, Observation
-from pydantic import Field
+from pydantic import BaseModel, Field
+
+
+ToolName = Literal[
+    "kubectl_get",
+    "kubectl_describe",
+    "kubectl_logs",
+    "kubectl_top_pods",
+    "kubectl_top_nodes",
+    "kubectl_patch_resources",
+    "kubectl_patch_tolerations",
+    "kubectl_cordon",
+    "kubectl_uncordon",
+    "kubectl_delete_pod",
+]
+
+
+class PodObservation(BaseModel):
+    name: str
+    namespace: str
+    phase: str
+    reason: str | None = None
+    node: str | None = None
+    restarts: int = 0
+    priority_class: str | None = None
+
+
+class NodeConditionObservation(BaseModel):
+    type: str
+    status: str
+
+
+class NodeObservation(BaseModel):
+    name: str
+    ready: bool
+    conditions: list[NodeConditionObservation] = Field(default_factory=list)
+    allocatable: dict[str, Any] = Field(default_factory=dict)
 
 
 class KubemedicAction(Action):
-    """Action for the Kubemedic environment - just a message to echo."""
+    """Tool invocation sent to the KubeMedic environment."""
 
-    message: str = Field(..., description="Message to echo back")
+    tool: ToolName
+    args: dict[str, Any] = Field(default_factory=dict)
 
 
 class KubemedicObservation(Observation):
-    """Observation from the Kubemedic environment - the echoed message."""
+    """Structured Kubernetes cluster observation returned by KubeMedic."""
 
-    echoed_message: str = Field(default="", description="The echoed message")
-    message_length: int = Field(default=0, description="Length of the echoed message")
+    t: int = 0
+    scenario: str | None = None
+    pods: list[PodObservation] = Field(default_factory=list)
+    nodes: list[NodeObservation] = Field(default_factory=list)

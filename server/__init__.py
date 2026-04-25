@@ -7,5 +7,6 @@
 """Kubemedic environment server components."""
 
 from .Kubemedic_environment import KubemedicEnvironment
+from .env import KubeMedicEnv
 
-__all__ = ["KubemedicEnvironment"]
+__all__ = ["KubemedicEnvironment", "KubeMedicEnv"]
