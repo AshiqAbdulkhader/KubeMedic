@@ -21,6 +21,7 @@ MUTATING_TOOLS = {
     "kubectl_cordon",
     "kubectl_uncordon",
     "kubectl_delete_pod",
+    "kubectl_delete_workload",
 }
 
 SCENARIO_DESCRIPTIONS = {
@@ -39,7 +40,7 @@ SCENARIO_ROOT_CAUSES = {
     "KUBE-06": "A log-flood DaemonSet fills node disk and causes DiskPressure evictions.",
 }
 
-SUPPORTED_SCENARIOS = {"KUBE-03", "KUBE-04", "KUBE-05"}
+SUPPORTED_SCENARIOS = {"KUBE-01", "KUBE-03", "KUBE-04", "KUBE-05", "KUBE-06"}
 
 POD_PRIORITY = {
     "api-gw": "critical",

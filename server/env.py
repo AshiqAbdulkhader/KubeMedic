@@ -83,7 +83,9 @@ class KubeMedicEnv:
 
         self._delete_namespace_if_present()
         await self._sleep(8)
+        await self._wait_for_namespace_deleted()
         self._create_challenge_namespace()
+        await self._wait_for_namespace_active()
         self._apply_base_workloads()
         await self._sleep(10)
         self._fault_result = inject_faults(self.clients, self.scenario)
@@ -124,6 +126,7 @@ class KubeMedicEnv:
                 reward=-5.0,
                 done=False,
                 metadata={
+                    "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
                     "blocked_reason": reason,
                     "info": {"disruptions": self.disruptions, "steps_taken": self.t},
                 },
@@ -165,6 +168,7 @@ class KubeMedicEnv:
             reward=reward,
             done=done,
             metadata={
+                "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
                 "tool_result": tool_result,
                 "info": {
                     "recovered": recovered,
@@ -205,6 +209,7 @@ class KubeMedicEnv:
             "kubectl_patch_resources",
             "kubectl_patch_tolerations",
             "kubectl_delete_pod",
+            "kubectl_delete_workload",
         } and namespace and namespace != CHALLENGE_NAMESPACE:
             return False, "Mutating tools may only target the challenge namespace"
 
@@ -214,7 +219,7 @@ class KubeMedicEnv:
         reward = 0.0
         pods = self._list_challenge_pods()
         for pod in pods:
-            if pod.status.phase == "Running":
+            if self._is_healthy_pod(pod):
                 priority = self._get_priority(pod.metadata.name)
                 reward += 20 if priority == "critical" else 10
 
@@ -233,7 +238,7 @@ class KubeMedicEnv:
             1 for node_name in self._initial_pressure_nodes if not self._node_name_under_pressure(node_name)
         )
 
-        reward -= 10 * sum(1 for pod in pods if pod.status.phase != "Running")
+        reward -= 10 * sum(1 for pod in pods if not self._is_healthy_pod(pod))
         return reward
 
     def _count_running(self) -> int:
@@ -243,12 +248,25 @@ class KubeMedicEnv:
         return {
             pod.metadata.name
             for pod in self._list_challenge_pods()
-            if pod.status.phase == "Running"
+            if self._is_healthy_pod(pod)
         }
 
     def _all_healthy(self) -> bool:
         pods = self._list_challenge_pods()
-        return bool(pods) and all(pod.status.phase == "Running" for pod in pods)
+        return bool(pods) and all(self._is_healthy_pod(pod) for pod in pods)
+
+    def _is_healthy_pod(self, pod: Any) -> bool:
+        if getattr(pod.status, "phase", None) != "Running":
+            return False
+
+        container_statuses = list(getattr(pod.status, "container_statuses", None) or [])
+        if not container_statuses:
+            return False
+
+        if any(not getattr(status, "ready", False) for status in container_statuses):
+            return False
+
+        return pod_reason(pod) in {None, "Running"}
 
     def _get_priority(self, pod_name: str) -> str:
         for workload_name, priority in POD_PRIORITY.items():
@@ -300,6 +318,50 @@ class KubeMedicEnv:
         except ApiException as exc:
             if exc.status != 409:
                 raise
+
+    async def _wait_for_namespace_deleted(
+        self,
+        *,
+        timeout_s: float = 180.0,
+        interval_s: float = 2.0,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                self.clients.core.read_namespace(CHALLENGE_NAMESPACE)
+            except ApiException as exc:
+                if exc.status == 404:
+                    return
+                raise
+            await self._sleep(interval_s)
+
+        raise TimeoutError(
+            f"Namespace {CHALLENGE_NAMESPACE!r} was still present after {timeout_s:.0f}s"
+        )
+
+    async def _wait_for_namespace_active(
+        self,
+        *,
+        timeout_s: float = 60.0,
+        interval_s: float = 1.0,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                namespace = self.clients.core.read_namespace(CHALLENGE_NAMESPACE)
+            except ApiException as exc:
+                if exc.status == 404:
+                    await self._sleep(interval_s)
+                    continue
+                raise
+
+            if getattr(namespace.status, "phase", None) == "Active":
+                return
+            await self._sleep(interval_s)
+
+        raise TimeoutError(
+            f"Namespace {CHALLENGE_NAMESPACE!r} did not become Active after {timeout_s:.0f}s"
+        )
 
     async def _cleanup_previous_faults(self) -> None:
         if self._fault_result is None:

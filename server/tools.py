@@ -550,6 +550,40 @@ class KubeToolExecutor:
             "side_effects": [f"Deleted pod/{pod_name}"],
         }
 
+    def kubectl_delete_workload(
+        self,
+        resource: str,
+        name: str,
+        namespace: str = CHALLENGE_NAMESPACE,
+    ) -> dict[str, Any]:
+        resource = resource.lower()
+
+        if resource in {"daemonset", "daemonsets"}:
+            self.clients.apps.delete_namespaced_daemon_set(
+                name=name,
+                namespace=namespace,
+                body=k8s_client.V1DeleteOptions(),
+            )
+            resource_name = "daemonset"
+        elif resource in {"deployment", "deployments"}:
+            self.clients.apps.delete_namespaced_deployment(
+                name=name,
+                namespace=namespace,
+                body=k8s_client.V1DeleteOptions(),
+            )
+            resource_name = "deployment"
+        else:
+            raise ValueError(
+                "kubectl_delete_workload supports only deployment and daemonset"
+            )
+
+        return {
+            "resource": resource_name,
+            "name": name,
+            "namespace": namespace,
+            "side_effects": [f"Deleted {resource_name}/{name}"],
+        }
+
     def pod_phase(self, pod_name: str, namespace: str = CHALLENGE_NAMESPACE) -> str | None:
         try:
             pod = self.clients.core.read_namespaced_pod(name=pod_name, namespace=namespace)

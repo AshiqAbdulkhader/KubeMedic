@@ -60,3 +60,29 @@ def test_patch_resources_builds_expected_patch() -> None:
         }
     }
     assert "side_effects" in result
+
+
+def test_delete_workload_routes_daemonset_delete() -> None:
+    recorded: dict[str, object] = {}
+
+    apps = SimpleNamespace(
+        delete_namespaced_daemon_set=lambda name, namespace, body: recorded.update(
+            {"name": name, "namespace": namespace, "body_type": type(body).__name__}
+        )
+    )
+    clients = SimpleNamespace(apps=apps)
+    executor = KubeToolExecutor(clients)
+
+    result = executor.kubectl_delete_workload(
+        resource="daemonset",
+        name="log-flood",
+        namespace="challenge",
+    )
+
+    assert recorded == {
+        "name": "log-flood",
+        "namespace": "challenge",
+        "body_type": "V1DeleteOptions",
+    }
+    assert result["resource"] == "daemonset"
+    assert "Deleted daemonset/log-flood" in result["side_effects"][0]

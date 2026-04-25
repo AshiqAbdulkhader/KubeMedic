@@ -25,6 +25,7 @@ ToolName = Literal[
     "kubectl_cordon",
     "kubectl_uncordon",
     "kubectl_delete_pod",
+    "kubectl_delete_workload",
 ]
 
 
