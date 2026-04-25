@@ -461,6 +461,18 @@ class KubeToolExecutor:
         requests_cpu_m: int | None = None,
         limits_cpu_m: int | None = None,
     ) -> dict[str, Any]:
+        deployment = self.clients.apps.read_namespaced_deployment(
+            name=deployment_name, namespace=namespace
+        )
+        existing_names = [
+            c.name for c in (getattr(deployment.spec.template.spec, "containers", None) or [])
+        ]
+        if container_name not in existing_names:
+            raise ValueError(
+                f"Container '{container_name}' not found in deployment "
+                f"'{deployment_name}'. Available containers: {existing_names}"
+            )
+
         container: dict[str, Any] = {"name": container_name, "resources": {}}
         if limits_memory_mi or limits_cpu_m:
             container["resources"]["limits"] = {}

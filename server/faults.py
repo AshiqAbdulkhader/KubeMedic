@@ -28,11 +28,26 @@ def _apply_objects(clients: KubernetesClients, objects: list[dict[str, Any]]) ->
 
 
 def _first_ready_node(clients: KubernetesClients) -> Any:
+    """Return a Ready, schedulable node with no pre-existing NoSchedule taints."""
+    candidate = None
     for node in clients.core.list_node().items:
-        if not getattr(node.spec, "unschedulable", False):
-            for condition in getattr(node.status, "conditions", None) or []:
-                if condition.type == "Ready" and condition.status == "True":
-                    return node
+        if getattr(node.spec, "unschedulable", False):
+            continue
+        ready = any(
+            c.type == "Ready" and c.status == "True"
+            for c in (getattr(node.status, "conditions", None) or [])
+        )
+        if not ready:
+            continue
+        existing_blocking_taints = [
+            t for t in (getattr(node.spec, "taints", None) or [])
+            if getattr(t, "effect", None) in ("NoSchedule", "NoExecute")
+        ]
+        if not existing_blocking_taints:
+            return node
+        candidate = candidate or node  # fallback if no clean node exists
+    if candidate is not None:
+        return candidate
     raise RuntimeError("No schedulable Ready node available for KUBE-05 injection")
 
 
@@ -78,6 +93,7 @@ def _inject_kube_01(clients: KubernetesClients) -> FaultInjectionResult:
                         {
                             "name": "memory-hog",
                             "image": "polinux/stress",
+                            "command": ["stress"],
                             "args": ["--vm", "1", "--vm-bytes", "3072M", "--vm-keep"],
                             "resources": {
                                 "requests": {"memory": "3072Mi", "cpu": "100m"},
@@ -168,6 +184,7 @@ def _inject_kube_03(clients: KubernetesClients) -> FaultInjectionResult:
                                 {
                                     "name": "payment-svc",
                                     "image": "polinux/stress",
+                                    "command": ["stress"],
                                     "args": ["--vm", "1", "--vm-bytes", "380M", "--vm-keep"],
                                     "resources": {
                                         "requests": {"memory": "128Mi", "cpu": "100m"},

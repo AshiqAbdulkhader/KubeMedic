@@ -147,7 +147,30 @@ class KubeMedicEnv:
             if targeted_phase == "Running":
                 reward -= 25.0
 
-        tool_result = self.tools.dispatch(action.tool, **action.args)
+        try:
+            tool_result = self.tools.dispatch(action.tool, **action.args)
+        except (ValueError, TypeError) as exc:
+            return KubemedicObservation(
+                **self._obs(),
+                reward=-5.0,
+                done=False,
+                metadata={
+                    "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
+                    "blocked_reason": f"Invalid tool invocation: {exc}",
+                    "info": {"disruptions": self.disruptions, "steps_taken": self.t},
+                },
+            )
+        except ApiException as exc:
+            return KubemedicObservation(
+                **self._obs(),
+                reward=-5.0,
+                done=False,
+                metadata={
+                    "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
+                    "blocked_reason": f"Kubernetes API error ({exc.status}): {exc.reason}",
+                    "info": {"disruptions": self.disruptions, "steps_taken": self.t},
+                },
+            )
         await self._sleep(4)
 
         current_running = self._running_pod_names()
