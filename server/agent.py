@@ -234,7 +234,7 @@ async def run_episode_with_env(
                 args=action_dict.get("args", {}),
             )
         except Exception as exc:
-            info = (observation.get("metadata", {}) or {}).get("info", {}) or {}
+            info = observation.get("info") or (observation.get("metadata", {}) or {}).get("info") or {}
             transcript.append(
                 {
                     "step": step_index,

@@ -109,12 +109,10 @@ class KubeMedicEnv:
             **self._obs(),
             reward=0.0,
             done=False,
-            metadata={
-                "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
-                "info": {
-                    "disruptions": self.disruptions,
-                    "steps_taken": self.t,
-                },
+            scenario_root_cause=SCENARIO_ROOT_CAUSES.get(self.scenario),
+            info={
+                "disruptions": self.disruptions,
+                "steps_taken": self.t,
             },
         )
 
@@ -128,11 +126,9 @@ class KubeMedicEnv:
                 **self._obs(),
                 reward=-5.0,
                 done=False,
-                metadata={
-                    "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
-                    "blocked_reason": reason,
-                    "info": {"disruptions": self.disruptions, "steps_taken": self.t},
-                },
+                scenario_root_cause=SCENARIO_ROOT_CAUSES.get(self.scenario),
+                blocked_reason=reason,
+                info={"disruptions": self.disruptions, "steps_taken": self.t},
             )
 
         prev_running = self._running_pod_names()
@@ -154,22 +150,18 @@ class KubeMedicEnv:
                 **self._obs(),
                 reward=-5.0,
                 done=False,
-                metadata={
-                    "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
-                    "blocked_reason": f"Invalid tool invocation: {exc}",
-                    "info": {"disruptions": self.disruptions, "steps_taken": self.t},
-                },
+                scenario_root_cause=SCENARIO_ROOT_CAUSES.get(self.scenario),
+                blocked_reason=f"Invalid tool invocation: {exc}",
+                info={"disruptions": self.disruptions, "steps_taken": self.t},
             )
         except ApiException as exc:
             return KubemedicObservation(
                 **self._obs(),
                 reward=-5.0,
                 done=False,
-                metadata={
-                    "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
-                    "blocked_reason": f"Kubernetes API error ({exc.status}): {exc.reason}",
-                    "info": {"disruptions": self.disruptions, "steps_taken": self.t},
-                },
+                scenario_root_cause=SCENARIO_ROOT_CAUSES.get(self.scenario),
+                blocked_reason=f"Kubernetes API error ({exc.status}): {exc.reason}",
+                info={"disruptions": self.disruptions, "steps_taken": self.t},
             )
         await self._sleep(4)
 
@@ -193,16 +185,14 @@ class KubeMedicEnv:
             **observation_data,
             reward=reward,
             done=done,
-            metadata={
-                "scenario_root_cause": SCENARIO_ROOT_CAUSES.get(self.scenario),
-                "tool_result": tool_result,
-                "info": {
-                    "recovered": recovered,
-                    "disrupted": disrupted,
-                    "disruptions": self.disruptions,
-                    "steps_taken": self.t,
-                    "targeted_phase": targeted_phase,
-                },
+            scenario_root_cause=SCENARIO_ROOT_CAUSES.get(self.scenario),
+            tool_result=tool_result,
+            info={
+                "recovered": recovered,
+                "disrupted": disrupted,
+                "disruptions": self.disruptions,
+                "steps_taken": self.t,
+                "targeted_phase": targeted_phase,
             },
         )
 

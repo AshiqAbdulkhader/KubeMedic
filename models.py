@@ -93,3 +93,7 @@ class KubemedicObservation(Observation):
     scenario: str | None = None
     pods: list[PodObservation] = Field(default_factory=list)
     nodes: list[NodeObservation] = Field(default_factory=list)
+    tool_result: dict[str, Any] | None = None
+    blocked_reason: str | None = None
+    scenario_root_cause: str | None = None
+    info: dict[str, Any] = Field(default_factory=dict)

@@ -92,7 +92,9 @@ def build_transcript_step(
     action_payload = _action_dict(action)
     observation = _observation_dict(result)
     pods = observation.get("pods", []) or []
-    info = (observation.get("metadata", {}) or {}).get("info", {}) or {}
+    metadata = observation.get("metadata", {}) or {}
+    info = observation.get("info") or metadata.get("info") or {}
+    blocked_reason = observation.get("blocked_reason") or metadata.get("blocked_reason")
 
     return {
         "step": step,
@@ -102,7 +104,7 @@ def build_transcript_step(
         "done": bool(observation.get("done", False)),
         "running": sum(1 for pod in pods if pod.get("phase") == "Running"),
         "disruptions": int(info.get("disruptions", 0) or 0),
-        "blocked_reason": (observation.get("metadata", {}) or {}).get("blocked_reason"),
+        "blocked_reason": blocked_reason,
     }
 
 
@@ -116,7 +118,7 @@ def build_episode_log(
     observation = _observation_dict(final_result_or_observation)
     pods = observation.get("pods", []) or []
     metadata = observation.get("metadata", {}) or {}
-    info = metadata.get("info", {}) or {}
+    info = observation.get("info") or metadata.get("info") or {}
     transcript_disruptions = [int(step.get("disruptions", 0) or 0) for step in transcript]
 
     return {
@@ -377,6 +379,7 @@ def grade_recorded_episode(
 
     resolved_root_cause = (
         true_root_cause
+        or observation.get("scenario_root_cause")
         or metadata.get("scenario_root_cause")
         or SCENARIO_ROOT_CAUSES.get(str(resolved_scenario))
     )
