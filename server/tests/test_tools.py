@@ -30,6 +30,15 @@ def test_patch_resources_builds_expected_patch() -> None:
     recorded: dict[str, object] = {}
 
     apps = SimpleNamespace(
+        read_namespaced_deployment=lambda name, namespace: SimpleNamespace(
+            spec=SimpleNamespace(
+                template=SimpleNamespace(
+                    spec=SimpleNamespace(
+                        containers=[SimpleNamespace(name="payment-svc")]
+                    )
+                )
+            )
+        ),
         patch_namespaced_deployment=lambda name, namespace, body: recorded.update(
             {"name": name, "namespace": namespace, "body": body}
         )
