@@ -10,7 +10,10 @@ from kubernetes.client import ApiException, V1DeleteOptions, V1Namespace
 from kubernetes.utils import create_from_dict
 from openenv.core.env_server.types import State
 
-from ..models import KubemedicAction, KubemedicObservation
+try:
+    from ..models import KubemedicAction, KubemedicObservation
+except ImportError:
+    from models import KubemedicAction, KubemedicObservation
 from .cluster import AksClusterClientFactory, KubernetesClients
 from .faults import FaultInjectionResult, cleanup as cleanup_faults, inject as inject_faults
 from .manifests import load_base_workloads

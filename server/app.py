@@ -38,7 +38,7 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import KubemedicAction, KubemedicObservation
     from .Kubemedic_environment import KubemedicEnvironment
-except ModuleNotFoundError:
+except ImportError:
     from models import KubemedicAction, KubemedicObservation
     from server.Kubemedic_environment import KubemedicEnvironment
 
