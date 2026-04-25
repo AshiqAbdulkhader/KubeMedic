@@ -190,8 +190,11 @@ def _fetch_user_kubeconfig(
     except ClusterConnectionError:
         raise
     except Exception as exc:
+        # Preserve Azure SDK details (status code/reason) so container logs
+        # immediately show whether this is auth, RBAC, or wrong cluster metadata.
+        details = str(exc).strip() or exc.__class__.__name__
         raise ClusterConnectionError(
-            "Failed to retrieve AKS user credentials from Azure"
+            f"Failed to retrieve AKS user credentials from Azure: {details}"
         ) from exc
     finally:
         _safe_close(aks_client)
