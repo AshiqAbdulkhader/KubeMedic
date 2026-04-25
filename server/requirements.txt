@@ -1,6 +1,8 @@
-openenv[core]>=0.2.0
+openenv-core[core]>=0.2.2
 fastapi>=0.115.0
 uvicorn>=0.24.0
-
-
-
+azure-identity>=1.25.3
+azure-mgmt-containerservice>=41.1.0
+kubernetes>=35.0.0
+python-dotenv>=1.2.2
+pyyaml>=6.0.3

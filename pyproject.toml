@@ -14,6 +14,9 @@ version = "0.1.0"
 description = "Kubemedic environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
+    "azure-identity>=1.25.3",
+    "azure-mgmt-containerservice>=41.1.0",
+    "kubernetes>=35.0.0",
     # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
     # install from github
     # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
@@ -26,6 +29,8 @@ dependencies = [
     # "gymnasium>=0.29.0",
     # "openspiel>=1.0.0",
     # "smolagents>=1.22.0,<2",
+    "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
 ]
 
 [project.optional-dependencies]
@@ -43,3 +48,6 @@ server = "Kubemedic.server.app:main"
 include-package-data = true
 packages = ["Kubemedic", "Kubemedic.server"]
 package-dir = { "Kubemedic" = ".", "Kubemedic.server" = "server" }
+
+[tool.setuptools.package-data]
+"Kubemedic.server" = ["k8s/*.yaml"]

@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gw
+  namespace: challenge
+  labels:
+    app: api-gw
+    priority: critical
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gw
+  template:
+    metadata:
+      labels:
+        app: api-gw
+    spec:
+      containers:
+        - name: api-gw
+          image: nginx:alpine
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-svc
+  namespace: challenge
+  labels:
+    app: auth-svc
+    priority: critical
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-svc
+  template:
+    metadata:
+      labels:
+        app: auth-svc
+    spec:
+      containers:
+        - name: auth-svc
+          image: nginx:alpine
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+            limits:
+              memory: "64Mi"
+              cpu: "50m"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-svc
+  namespace: challenge
+  labels:
+    app: order-svc
+    priority: high
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-svc
+  template:
+    metadata:
+      labels:
+        app: order-svc
+    spec:
+      containers:
+        - name: order-svc
+          image: nginx:alpine
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
