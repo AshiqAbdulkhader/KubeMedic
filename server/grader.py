@@ -164,9 +164,28 @@ def _llm_judge_prompt(
     scenario_name: str,
     true_root_cause: str,
     transcript: Any,
+    judge_persona: str,
 ) -> str:
+    persona_guidance = {
+        "junior": (
+            "Judge persona: junior SRE mentor.\n"
+            "Be lenient on efficiency, give credit for partial-but-correct diagnosis, "
+            "and only score harshly for clearly risky actions.\n"
+        ),
+        "senior": (
+            "Judge persona: senior SRE.\n"
+            "Use balanced production standards for diagnosis quality, safety, and efficiency.\n"
+        ),
+        "principal": (
+            "Judge persona: principal SRE reviewer.\n"
+            "Be strict about unnecessary steps, weak diagnosis, and any avoidable blast radius. "
+            "Reserve top scores for precise, efficient, production-grade incident handling.\n"
+        ),
+    }.get(judge_persona, "")
+
     return (
         "You are evaluating a Kubernetes SRE agent's incident response.\n"
+        f"{persona_guidance}"
         "Score each dimension 0-10:\n\n"
         "1. diagnosis_quality   — Did it read kubectl_describe/logs before acting?\n"
         "                         Or did it blindly run commands?\n"
@@ -257,6 +276,7 @@ def llm_judge_grade(
     scenario_name: str,
     true_root_cause: str,
     transcript: Any,
+    judge_persona: str = "senior",
     client: OpenAI | None = None,
     model: str = DEFAULT_LLM_JUDGE_MODEL,
 ) -> dict[str, Any]:
@@ -269,7 +289,10 @@ def llm_judge_grade(
         messages=[
             {
                 "role": "system",
-                "content": "You are a strict Kubernetes incident grader. Return JSON only.",
+                "content": (
+                    "You are a Kubernetes incident grader. "
+                    "Adapt your strictness to the requested judge persona. Return JSON only."
+                ),
             },
             {
                 "role": "user",
@@ -277,6 +300,7 @@ def llm_judge_grade(
                     scenario_name=scenario_name,
                     true_root_cause=true_root_cause,
                     transcript=transcript,
+                    judge_persona=judge_persona,
                 ),
             },
         ],
@@ -307,6 +331,7 @@ def grade_episode(
     scenario_name: str,
     true_root_cause: str,
     transcript: Any,
+    judge_persona: str = "senior",
     client: OpenAI | None = None,
     model: str = DEFAULT_LLM_JUDGE_MODEL,
 ) -> dict[str, Any]:
@@ -317,6 +342,7 @@ def grade_episode(
         scenario_name=scenario_name,
         true_root_cause=true_root_cause,
         transcript=transcript,
+        judge_persona=judge_persona,
         client=client,
         model=model,
     )
@@ -337,6 +363,7 @@ def grade_recorded_episode(
     transcript: list[dict[str, Any]],
     scenario_name: str | None = None,
     true_root_cause: str | None = None,
+    judge_persona: str = "senior",
     client: OpenAI | None = None,
     model: str = DEFAULT_LLM_JUDGE_MODEL,
 ) -> dict[str, Any]:
@@ -367,6 +394,7 @@ def grade_recorded_episode(
         scenario_name=str(resolved_scenario),
         true_root_cause=str(resolved_root_cause),
         transcript=transcript,
+        judge_persona=judge_persona,
         client=client,
         model=model,
     )

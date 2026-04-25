@@ -6,7 +6,8 @@
 
 """Kubemedic environment server components."""
 
+from .curriculum import CurriculumController
 from .Kubemedic_environment import KubemedicEnvironment
 from .env import KubeMedicEnv
 
-__all__ = ["KubemedicEnvironment", "KubeMedicEnv"]
+__all__ = ["CurriculumController", "KubemedicEnvironment", "KubeMedicEnv"]

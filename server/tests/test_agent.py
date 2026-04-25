@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from Kubemedic.server.agent import run_episode_with_env
+from Kubemedic.server.curriculum import CurriculumController
 
 
 class FakeEnv:
@@ -161,3 +162,34 @@ async def test_run_episode_with_env_records_invalid_json_turn(
     assert result["transcript"][0]["tool"] == "__invalid_json__"
     assert "error" in result["transcript"][0]
     assert result["steps"] == 3
+
+
+@pytest.mark.anyio
+async def test_run_episode_with_env_uses_curriculum_selection_and_records_outcome(
+    fake_model_client: SimpleNamespace,
+    fake_grader_client: SimpleNamespace,
+) -> None:
+    curriculum = CurriculumController(
+        fault_catalog={
+            "oom_kill": {
+                "tier": 1,
+                "min_difficulty": 0.0,
+                "scenarios": ["KUBE-03"],
+            }
+        }
+    )
+
+    result = await run_episode_with_env(
+        FakeEnv(),
+        scenario=None,
+        curriculum=curriculum,
+        client=fake_model_client,
+        grader_client=fake_grader_client,
+    )
+
+    assert result["scenario"] == "KUBE-03"
+    assert result["fault_type"] == "oom_kill"
+    assert result["judge_persona"] == "junior"
+    assert result["solved"] is True
+    assert result["curriculum"]["before"]["episode_count"] == 0
+    assert result["curriculum"]["after"]["episode_count"] == 1

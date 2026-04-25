@@ -14,10 +14,12 @@ from openai import OpenAI
 
 from ..client import KubemedicEnv
 from ..models import KubemedicAction
+from .curriculum import CurriculumController
 from .grader import (
     DEFAULT_ENV_FILE,
     DEFAULT_LLM_JUDGE_MODEL,
     HF_ROUTER_BASE_URL,
+    build_episode_log,
     build_transcript_step,
     grade_recorded_episode,
 )
@@ -171,18 +173,39 @@ def _observation_payload(result_or_observation: Any) -> dict[str, Any]:
 async def run_episode_with_env(
     env: Any,
     *,
-    scenario: str = "KUBE-03",
+    scenario: str | None = "KUBE-03",
     max_steps: int = 30,
     client: OpenAI | None = None,
     model: str = DEFAULT_AGENT_MODEL,
     grader_client: OpenAI | None = None,
     grader_model: str = DEFAULT_LLM_JUDGE_MODEL,
     grade: bool = True,
+    curriculum: CurriculumController | None = None,
+    judge_persona: str | None = None,
 ) -> dict[str, Any]:
     """Run an agent episode against an already-constructed async env client."""
 
     model_client = client or create_agent_client()
-    reset_result = await env.reset(scenario=scenario)
+    selected_scenario = scenario
+    selected_fault_type = None
+    curriculum_state_before = None
+
+    if curriculum is not None:
+        curriculum_state_before = curriculum.get_stats()
+        if selected_scenario is None:
+            selected_scenario = curriculum.pick_scenario()
+        if selected_scenario is None:
+            raise RuntimeError(
+                "Curriculum requested adversarial scenario generation, "
+                "but no adversarial scenario generator is configured"
+            )
+        selected_fault_type = curriculum.resolve_fault_type(selected_scenario)
+        judge_persona = judge_persona or curriculum.get_judge_persona()
+
+    selected_scenario = selected_scenario or "KUBE-03"
+    judge_persona = judge_persona or "senior"
+
+    reset_result = await env.reset(scenario=selected_scenario)
     observation = _observation_payload(reset_result)
     history: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     transcript: list[dict[str, Any]] = []
@@ -252,32 +275,66 @@ async def run_episode_with_env(
         grading = grade_recorded_episode(
             final_result_or_observation=final_result,
             transcript=transcript,
+            judge_persona=judge_persona,
             client=grader_client or model_client,
             model=grader_model,
         )
 
     final_observation = _observation_payload(final_result)
+    episode_log = (
+        grading["episode_log"]
+        if grading is not None
+        else build_episode_log(
+            final_result_or_observation=final_result,
+            transcript=transcript,
+        )
+    )
+    solved = bool(final_observation.get("done", False)) and (
+        int(episode_log["final_running"]) == int(episode_log["total_pods"]) and int(episode_log["total_pods"]) > 0
+    )
+
+    if curriculum is not None:
+        curriculum.record(
+            selected_fault_type or selected_scenario.lower(),
+            solved,
+            len(transcript),
+            total_reward,
+        )
+
     return {
-        "scenario": scenario,
+        "scenario": selected_scenario,
+        "fault_type": selected_fault_type,
+        "judge_persona": judge_persona,
         "model": model,
         "steps": len(transcript),
+        "solved": solved,
         "total_reward": total_reward,
         "final_observation": final_observation,
         "transcript": transcript,
         "grading": grading,
+        "curriculum": (
+            {
+                "before": curriculum_state_before,
+                "after": curriculum.get_stats(),
+            }
+            if curriculum is not None
+            else None
+        ),
     }
 
 
 async def run_episode(
     *,
     base_url: str,
-    scenario: str = "KUBE-03",
+    scenario: str | None = "KUBE-03",
     max_steps: int = 30,
     client: OpenAI | None = None,
     model: str = DEFAULT_AGENT_MODEL,
     grader_client: OpenAI | None = None,
     grader_model: str = DEFAULT_LLM_JUDGE_MODEL,
     grade: bool = True,
+    curriculum: CurriculumController | None = None,
+    judge_persona: str | None = None,
 ) -> dict[str, Any]:
     """Connect to an OpenEnv server and run one KubeMedic agent episode."""
 
@@ -291,29 +348,85 @@ async def run_episode(
             grader_client=grader_client,
             grader_model=grader_model,
             grade=grade,
+            curriculum=curriculum,
+            judge_persona=judge_persona,
         )
+
+
+async def run_curriculum(
+    *,
+    base_url: str,
+    episodes: int,
+    max_steps: int = 30,
+    client: OpenAI | None = None,
+    model: str = DEFAULT_AGENT_MODEL,
+    grader_client: OpenAI | None = None,
+    grader_model: str = DEFAULT_LLM_JUDGE_MODEL,
+    grade: bool = True,
+    curriculum: CurriculumController | None = None,
+) -> dict[str, Any]:
+    """Run multiple episodes while letting the curriculum pick each scenario."""
+
+    controller = curriculum or CurriculumController()
+    results: list[dict[str, Any]] = []
+
+    async with KubemedicEnv(base_url=base_url) as env:
+        for _ in range(episodes):
+            results.append(
+                await run_episode_with_env(
+                    env,
+                    scenario=None,
+                    max_steps=max_steps,
+                    client=client,
+                    model=model,
+                    grader_client=grader_client,
+                    grader_model=grader_model,
+                    grade=grade,
+                    curriculum=controller,
+                )
+            )
+
+    return {
+        "episodes": episodes,
+        "results": results,
+        "curriculum": controller.get_stats(),
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--scenario", default="KUBE-03")
+    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--use-curriculum", action="store_true")
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--model", default=DEFAULT_AGENT_MODEL)
     parser.add_argument("--grader-model", default=DEFAULT_LLM_JUDGE_MODEL)
     parser.add_argument("--no-grade", action="store_true")
     args = parser.parse_args()
 
-    result = asyncio.run(
-        run_episode(
-            base_url=args.base_url,
-            scenario=args.scenario,
-            max_steps=args.max_steps,
-            model=args.model,
-            grader_model=args.grader_model,
-            grade=not args.no_grade,
+    if args.use_curriculum:
+        result = asyncio.run(
+            run_curriculum(
+                base_url=args.base_url,
+                episodes=args.episodes,
+                max_steps=args.max_steps,
+                model=args.model,
+                grader_model=args.grader_model,
+                grade=not args.no_grade,
+            )
         )
-    )
+    else:
+        result = asyncio.run(
+            run_episode(
+                base_url=args.base_url,
+                scenario=args.scenario,
+                max_steps=args.max_steps,
+                model=args.model,
+                grader_model=args.grader_model,
+                grade=not args.no_grade,
+            )
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
