@@ -8,10 +8,11 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 from openenv.core.env_server.types import Action, Observation
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 ToolName = Literal[
@@ -56,6 +57,33 @@ class KubemedicAction(Action):
 
     tool: ToolName
     args: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_args(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        args = normalized.get("args")
+
+        if args is None:
+            normalized["args"] = {}
+            return normalized
+
+        if isinstance(args, str):
+            stripped_args = args.strip()
+            if stripped_args.startswith("{") and stripped_args.endswith("}"):
+                parsed_args = json.loads(stripped_args)
+                if not isinstance(parsed_args, dict):
+                    raise TypeError("JSON args payload must decode to an object")
+                normalized["args"] = parsed_args
+                return normalized
+
+            if normalized.get("tool") == "kubectl_get":
+                normalized["args"] = {"resource": args}
+
+        return normalized
 
 
 class KubemedicObservation(Observation):

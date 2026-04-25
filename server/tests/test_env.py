@@ -64,6 +64,18 @@ def test_guard_blocks_protected_namespace_mutation() -> None:
     assert "protected namespace" in str(reason)
 
 
+def test_action_normalizes_string_args_for_kubectl_get() -> None:
+    action = KubemedicAction(tool="kubectl_get", args="pods")
+
+    assert action.args == {"resource": "pods"}
+
+
+def test_action_normalizes_json_string_args() -> None:
+    action = KubemedicAction(tool="kubectl_get", args='{"resource": "pods"}')
+
+    assert action.args == {"resource": "pods"}
+
+
 def test_guard_blocks_force_delete_outside_challenge() -> None:
     env = KubeMedicEnv(clients=SimpleNamespace(), tool_executor=SimpleNamespace())
     allowed, reason = env._guard(
