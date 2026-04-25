@@ -294,11 +294,13 @@ async def run_episode_with_env(
     )
 
     if curriculum is not None:
+        quality_score = grading["final_score"] if grading is not None else None
         curriculum.record(
             selected_fault_type or selected_scenario.lower(),
             solved,
             len(transcript),
             total_reward,
+            quality_score=quality_score,
         )
 
     return {

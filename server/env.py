@@ -31,6 +31,28 @@ from .tools import KubeToolExecutor, pod_reason, serialize_node_summary, seriali
 
 SleepFn = Callable[[float], Awaitable[None]]
 
+STEP_PENALTY = -0.25
+EARLY_PODS_SNAPSHOT_REWARD = 1.0
+DESCRIBE_BROKEN_POD_REWARD = 2.0
+LOGS_PREVIOUS_REWARD = 2.0
+TOP_PODS_REWARD = 2.0
+TOP_NODES_REWARD = 1.0
+PREMATURE_MUTATION_PENALTY = -2.0
+REPEATED_NOOP_PENALTY = -1.0
+POST_FIX_CONFIRMATION_REWARD = 1.0
+CONFIRMED_SAFE_STOP_REWARD = 2.0
+CORRECT_FIX_BONUS = 5.0
+SYMPTOM_ONLY_PENALTY = -5.0
+
+PRESSURE_SCENARIOS = {"KUBE-01", "KUBE-06"}
+DIAGNOSTIC_TOOLS = {
+    "kubectl_get",
+    "kubectl_describe",
+    "kubectl_logs",
+    "kubectl_top_pods",
+    "kubectl_top_nodes",
+}
+
 
 class KubeMedicEnv:
     """AKS-backed Kubernetes repair environment."""
@@ -54,6 +76,7 @@ class KubeMedicEnv:
         self._fault_result: FaultInjectionResult | None = None
         self._state = State(episode_id=str(uuid4()), step_count=0, scenario=self.scenario, disruptions=self.disruptions)
         self._initial_pressure_nodes: set[str] = set()
+        self._reset_episode_tracking()
 
     @property
     def clients(self) -> KubernetesClients:
@@ -104,6 +127,7 @@ class KubeMedicEnv:
             for node in self._obs()["nodes"]
             if self._node_under_pressure(node)
         }
+        self._reset_episode_tracking()
 
         return KubemedicObservation(
             **self._obs(),
@@ -132,8 +156,10 @@ class KubeMedicEnv:
             )
 
         prev_running = self._running_pod_names()
-        reward = 0.0
+        prev_broken_pods = self._broken_pod_names()
+        reward = STEP_PENALTY
         targeted_phase = None
+        reward_breakdown: dict[str, float] = {"step_cost": STEP_PENALTY}
 
         if action.tool == "kubectl_delete_pod":
             targeted_phase = self.tools.pod_phase(
@@ -142,6 +168,14 @@ class KubeMedicEnv:
             )
             if targeted_phase == "Running":
                 reward -= 25.0
+                reward_breakdown["delete_running_pod_penalty"] = -25.0
+
+        behavior_reward, behavior_breakdown = self._behavior_reward(
+            action=action,
+            broken_pods=prev_broken_pods,
+        )
+        reward += behavior_reward
+        reward_breakdown.update(behavior_breakdown)
 
         try:
             tool_result = self.tools.dispatch(action.tool, **action.args)
@@ -169,15 +203,33 @@ class KubeMedicEnv:
         recovered = len(current_running - prev_running)
         disrupted = len(prev_running - current_running)
 
-        reward += recovered * 10.0
+        recovered_reward = recovered * 10.0
+        reward += recovered_reward
+        if recovered_reward:
+            reward_breakdown["recovered_pods"] = recovered_reward
         if disrupted:
-            reward -= disrupted * 25.0
+            disruption_penalty = disrupted * -25.0
+            reward += disruption_penalty
+            reward_breakdown["disrupted_pods"] = disruption_penalty
             self.disruptions += disrupted
+
+        noop_penalty = self._repeat_noop_penalty(
+            action=action,
+            recovered=recovered,
+            disrupted=disrupted,
+        )
+        reward += noop_penalty
+        if noop_penalty:
+            reward_breakdown["repeated_noop"] = noop_penalty
+
+        self._record_action_outcome(action)
 
         done = self.t >= MAX_STEPS or self._all_healthy()
         if done:
             await self._cleanup_previous_faults()
-            reward += self._terminal_reward()
+            terminal_reward = self._terminal_reward()
+            reward += terminal_reward
+            reward_breakdown["terminal"] = terminal_reward
 
         self._state.disruptions = self.disruptions
         observation_data = self._obs()
@@ -193,6 +245,7 @@ class KubeMedicEnv:
                 "disruptions": self.disruptions,
                 "steps_taken": self.t,
                 "targeted_phase": targeted_phase,
+                "reward_breakdown": reward_breakdown,
             },
         )
 
@@ -254,8 +307,166 @@ class KubeMedicEnv:
             1 for node_name in self._initial_pressure_nodes if not self._node_name_under_pressure(node_name)
         )
 
+        if self._post_fix_confirmation_seen and self._all_healthy():
+            reward += CONFIRMED_SAFE_STOP_REWARD
+
         reward -= 10 * sum(1 for pod in pods if not self._is_healthy_pod(pod))
         return reward
+
+    def _reset_episode_tracking(self) -> None:
+        self._diagnostic_tools_used: set[str] = set()
+        self._diagnosed_broken_pods: set[str] = set()
+        self._mutation_seen = False
+        self._post_fix_confirmation_seen = False
+        self._last_action_fingerprint: tuple[str, tuple[tuple[str, str], ...]] | None = None
+
+    def _broken_pod_names(self) -> set[str]:
+        return {
+            pod.metadata.name
+            for pod in self._list_challenge_pods()
+            if not self._is_healthy_pod(pod)
+        }
+
+    def _behavior_reward(
+        self,
+        *,
+        action: KubemedicAction,
+        broken_pods: set[str],
+    ) -> tuple[float, dict[str, float]]:
+        reward = 0.0
+        breakdown: dict[str, float] = {}
+        tool = action.tool
+
+        if (
+            tool == "kubectl_get"
+            and action.args.get("resource") == "pods"
+            and not self._diagnostic_tools_used
+            and not self._mutation_seen
+        ):
+            reward += EARLY_PODS_SNAPSHOT_REWARD
+            breakdown["early_pods_snapshot"] = EARLY_PODS_SNAPSHOT_REWARD
+
+        if (
+            tool == "kubectl_describe"
+            and not self._mutation_seen
+            and action.args.get("name") in broken_pods
+            and action.args.get("name") not in self._diagnosed_broken_pods
+        ):
+            reward += DESCRIBE_BROKEN_POD_REWARD
+            breakdown["described_broken_pod"] = DESCRIBE_BROKEN_POD_REWARD
+            self._diagnosed_broken_pods.add(str(action.args.get("name")))
+
+        if (
+            tool == "kubectl_logs"
+            and not self._mutation_seen
+            and self.scenario == "KUBE-03"
+            and action.args.get("previous") is True
+            and action.args.get("pod_name") in broken_pods
+            and "kubectl_logs_previous" not in self._diagnostic_tools_used
+        ):
+            reward += LOGS_PREVIOUS_REWARD
+            breakdown["logs_previous"] = LOGS_PREVIOUS_REWARD
+            self._diagnostic_tools_used.add("kubectl_logs_previous")
+
+        if tool == "kubectl_top_pods" and not self._mutation_seen and "kubectl_top_pods" not in self._diagnostic_tools_used:
+            reward += TOP_PODS_REWARD
+            breakdown["top_pods_before_fix"] = TOP_PODS_REWARD
+
+        if (
+            tool == "kubectl_top_nodes"
+            and not self._mutation_seen
+            and self.scenario in PRESSURE_SCENARIOS
+            and "kubectl_top_nodes" not in self._diagnostic_tools_used
+        ):
+            reward += TOP_NODES_REWARD
+            breakdown["top_nodes_pressure_check"] = TOP_NODES_REWARD
+
+        if self._is_mutating_action(action):
+            if not self._has_diagnostic_context():
+                reward += PREMATURE_MUTATION_PENALTY
+                breakdown["premature_mutation"] = PREMATURE_MUTATION_PENALTY
+            self._mutation_seen = True
+
+        fix_reward = self._scenario_fix_reward(action)
+        if fix_reward:
+            reward += fix_reward
+            breakdown["scenario_fix"] = fix_reward
+
+        if (
+            self._mutation_seen
+            and tool == "kubectl_get"
+            and action.args.get("resource") == "pods"
+            and not self._post_fix_confirmation_seen
+        ):
+            reward += POST_FIX_CONFIRMATION_REWARD
+            breakdown["post_fix_confirmation"] = POST_FIX_CONFIRMATION_REWARD
+            self._post_fix_confirmation_seen = True
+
+        if tool in DIAGNOSTIC_TOOLS:
+            self._diagnostic_tools_used.add(tool)
+
+        return reward, breakdown
+
+    def _scenario_fix_reward(self, action: KubemedicAction) -> float:
+        tool = action.tool
+        args = action.args
+
+        if self.scenario == "KUBE-03":
+            if tool == "kubectl_patch_resources" and args.get("deployment_name") == "payment-svc":
+                return CORRECT_FIX_BONUS
+            if tool == "kubectl_delete_pod" and str(args.get("pod_name", "")).startswith("payment-svc"):
+                return SYMPTOM_ONLY_PENALTY
+
+        if self.scenario == "KUBE-04":
+            if tool == "kubectl_patch_resources" and args.get("deployment_name") == "ml-inference":
+                return CORRECT_FIX_BONUS
+            if tool == "kubectl_delete_pod" and str(args.get("pod_name", "")).startswith("ml-inference"):
+                return SYMPTOM_ONLY_PENALTY
+
+        if self.scenario == "KUBE-05":
+            if tool == "kubectl_patch_tolerations" and args.get("deployment_name") == "gpu-workload":
+                return CORRECT_FIX_BONUS
+            if tool == "kubectl_delete_pod" and str(args.get("pod_name", "")).startswith("gpu-workload"):
+                return SYMPTOM_ONLY_PENALTY
+
+        if self.scenario == "KUBE-06":
+            if (
+                tool == "kubectl_delete_workload"
+                and args.get("resource") == "daemonset"
+                and args.get("name") == "log-flood"
+            ):
+                return CORRECT_FIX_BONUS
+            if tool == "kubectl_delete_pod" and str(args.get("pod_name", "")).startswith("log-flood"):
+                return SYMPTOM_ONLY_PENALTY
+
+        return 0.0
+
+    def _repeat_noop_penalty(
+        self,
+        *,
+        action: KubemedicAction,
+        recovered: int,
+        disrupted: int,
+    ) -> float:
+        fingerprint = self._action_fingerprint(action)
+        if fingerprint == self._last_action_fingerprint and recovered == 0 and disrupted == 0:
+            return REPEATED_NOOP_PENALTY
+        return 0.0
+
+    def _record_action_outcome(self, action: KubemedicAction) -> None:
+        self._last_action_fingerprint = self._action_fingerprint(action)
+
+    def _action_fingerprint(self, action: KubemedicAction) -> tuple[str, tuple[tuple[str, str], ...]]:
+        normalized_args = tuple(
+            sorted((str(key), repr(value)) for key, value in action.args.items())
+        )
+        return action.tool, normalized_args
+
+    def _is_mutating_action(self, action: KubemedicAction) -> bool:
+        return action.tool in MUTATING_TOOLS
+
+    def _has_diagnostic_context(self) -> bool:
+        return bool(self._diagnostic_tools_used or self._diagnosed_broken_pods)
 
     def _count_running(self) -> int:
         return len(self._running_pod_names())

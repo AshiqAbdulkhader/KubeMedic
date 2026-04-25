@@ -47,3 +47,19 @@ def test_curriculum_scales_judge_persona_with_difficulty() -> None:
     assert curriculum.get_tier_name() == "advanced"
     assert curriculum.get_judge_persona() == "principal"
     assert "disk_pressure" in curriculum.get_unlocked_fault_types()
+
+
+def test_curriculum_requires_quality_threshold_for_mastery_credit() -> None:
+    curriculum = CurriculumController(
+        quality_threshold=80.0,
+        fault_catalog={
+            "oom_kill": {"tier": 1, "min_difficulty": 0.0, "scenarios": ["KUBE-03"]},
+        },
+    )
+
+    for _ in range(3):
+        curriculum.record("oom_kill", True, 2, 25.0, quality_score=70.0)
+
+    assert curriculum.get_tier_name() == "warmup"
+    assert curriculum.get_graduated() == set()
+    assert curriculum.get_skill_profile()["oom_kill"] == 0.0

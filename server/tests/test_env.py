@@ -139,6 +139,83 @@ def test_crashloop_running_pod_is_not_treated_as_healthy() -> None:
     assert env._all_healthy() is False
 
 
+def test_behavior_reward_dense_diagnosis_and_correct_fix() -> None:
+    env = KubeMedicEnv(clients=SimpleNamespace(), tool_executor=SimpleNamespace())
+    env.scenario = "KUBE-03"
+    env._reset_episode_tracking()
+    broken = {"payment-svc-abc"}
+
+    reward, _ = env._behavior_reward(
+        action=KubemedicAction(tool="kubectl_get", args={"resource": "pods"}),
+        broken_pods=broken,
+    )
+    assert reward == 1.0
+
+    reward, _ = env._behavior_reward(
+        action=KubemedicAction(
+            tool="kubectl_describe",
+            args={"resource": "pod", "name": "payment-svc-abc", "namespace": "challenge"},
+        ),
+        broken_pods=broken,
+    )
+    assert reward == 2.0
+
+    reward, _ = env._behavior_reward(
+        action=KubemedicAction(
+            tool="kubectl_logs",
+            args={"pod_name": "payment-svc-abc", "namespace": "challenge", "previous": True},
+        ),
+        broken_pods=broken,
+    )
+    assert reward == 2.0
+
+    reward, _ = env._behavior_reward(
+        action=KubemedicAction(tool="kubectl_top_pods", args={"namespace": "challenge"}),
+        broken_pods=broken,
+    )
+    assert reward == 2.0
+
+    reward, _ = env._behavior_reward(
+        action=KubemedicAction(
+            tool="kubectl_patch_resources",
+            args={"deployment_name": "payment-svc", "namespace": "challenge", "container_name": "payment-svc"},
+        ),
+        broken_pods=broken,
+    )
+    assert reward == 5.0
+
+
+def test_behavior_reward_penalizes_premature_mutation_and_repeated_noop() -> None:
+    env = KubeMedicEnv(clients=SimpleNamespace(), tool_executor=SimpleNamespace())
+    env.scenario = "KUBE-01"
+    env._reset_episode_tracking()
+    action = KubemedicAction(
+        tool="kubectl_delete_pod",
+        args={"pod_name": "batch-job", "namespace": "challenge"},
+    )
+
+    reward, breakdown = env._behavior_reward(action=action, broken_pods={"batch-job"})
+    assert reward == -2.0
+    assert breakdown["premature_mutation"] == -2.0
+
+    env._record_action_outcome(action)
+    assert env._repeat_noop_penalty(action=action, recovered=0, disrupted=0) == -1.0
+
+
+def test_terminal_reward_includes_safe_confirmation_bonus() -> None:
+    env = KubeMedicEnv(clients=SimpleNamespace(), tool_executor=SimpleNamespace())
+    env.t = 12
+    env.disruptions = 0
+    env._post_fix_confirmation_seen = True
+    env._initial_pressure_nodes = set()
+    env._list_challenge_pods = lambda: [_pod("order-svc-123", "Running")]  # type: ignore[method-assign]
+    env._all_healthy = lambda: True  # type: ignore[method-assign]
+
+    reward = env._terminal_reward()
+
+    assert reward == 102
+
+
 @pytest.mark.anyio
 async def test_wait_for_namespace_deleted_polls_until_gone() -> None:
     class _Core:

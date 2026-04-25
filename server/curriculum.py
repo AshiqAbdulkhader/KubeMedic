@@ -63,6 +63,7 @@ class CurriculumController:
         fault_catalog: dict[str, dict[str, Any]] | None = None,
         rng: random.Random | None = None,
         min_difficulty: float | None = None,
+        quality_threshold: float | None = None,
     ) -> None:
         self._fault_catalog = fault_catalog or DEFAULT_FAULT_CATALOG
         self._rng = rng or random.Random()
@@ -82,6 +83,11 @@ class CurriculumController:
             else float(os.environ.get("EVAL_MIN_DIFFICULTY", "0.0"))
         )
         self._min_difficulty = max(0.0, forced_min_difficulty)
+        self._quality_threshold = (
+            quality_threshold
+            if quality_threshold is not None
+            else float(os.environ.get("CURRICULUM_QUALITY_THRESHOLD", "75.0"))
+        )
 
         if self._min_difficulty > 0:
             for i, tier in enumerate(DIFFICULTY_TIERS):
@@ -103,12 +109,30 @@ class CurriculumController:
                 return fault_type
         return None
 
-    def record(self, fault_type: str, success: bool, steps: int, reward: float) -> None:
+    def record(
+        self,
+        fault_type: str,
+        success: bool,
+        steps: int,
+        reward: float,
+        *,
+        quality_score: float | None = None,
+    ) -> None:
         """Record an episode outcome and update progression state."""
-        self.history[fault_type].append(success)
+        quality_pass = quality_score is None or quality_score >= self._quality_threshold
+        mastery_success = success and quality_pass
+
+        self.history[fault_type].append(mastery_success)
         self.step_counts[fault_type].append(steps)
         self.episode_rewards.append(reward)
-        self.episode_history.append({"fault_type": fault_type, "success": success})
+        self.episode_history.append(
+            {
+                "fault_type": fault_type,
+                "success": mastery_success,
+                "solved": success,
+                "quality_score": quality_score,
+            }
+        )
         self.episode_count += 1
         self._tier_episodes += 1
         self._maybe_advance_tier()
@@ -262,6 +286,7 @@ class CurriculumController:
             "tier_episodes": self._tier_episodes,
             "difficulty": round(self.get_difficulty(), 2),
             "judge_persona": self.get_judge_persona(),
+            "quality_threshold": self._quality_threshold,
             "skill_profile": self.get_skill_profile(),
             "graduated": sorted(self._graduated),
             "weak_spots": self.get_weak_spots(),
