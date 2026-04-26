@@ -60,7 +60,7 @@ train = [
 # Server entry point - enables running via: uv run --project . server
 # or: python -m Kubemedic.server.app
 server = "Kubemedic.server.app:main"
-train-kubemedic-grpo = "Kubemedic.training:main"
+train-kubemedic-grpo = "training:main"
 
 [tool.setuptools]
 include-package-data = true

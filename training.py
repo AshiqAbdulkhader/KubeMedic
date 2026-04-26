@@ -34,8 +34,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 from trl.experimental.openenv import generate_rollout_completions
 
-from .client import KubemedicEnv
-from .models import KubemedicAction, KubemedicObservation, ToolName
+try:
+    from .client import KubemedicEnv
+    from .models import KubemedicAction, KubemedicObservation, ToolName
+except ImportError:
+    # Allow running as a direct script from notebooks/local paths.
+    from client import KubemedicEnv
+    from models import KubemedicAction, KubemedicObservation, ToolName
 
 try:
     from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
