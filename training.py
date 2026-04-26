@@ -17,7 +17,6 @@ from typing import Any
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "kubemedic-mpl"))
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
-os.environ.setdefault("WANDB_DISABLED", "true")
 
 import matplotlib
 
@@ -77,6 +76,7 @@ DEFAULT_SCENARIOS = ["KUBE-01", "KUBE-03", "KUBE-04", "KUBE-05", "KUBE-06"]
 VALID_TOOLS = set(ToolName.__args__)  # type: ignore[attr-defined]
 CONNECT_TIMEOUT_S = 30.0
 MESSAGE_TIMEOUT_S = 240.0
+DEFAULT_ENV_FILES = [Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,6 +102,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-smoke-test", action="store_true")
     parser.add_argument("--smoke-only", action="store_true")
     parser.add_argument("--scenario-list", default=",".join(DEFAULT_SCENARIOS))
+    parser.add_argument("--wandb-project", default="kubemedic-grpo")
+    parser.add_argument("--wandb-run-name", default=None)
     return parser.parse_args()
 
 
@@ -110,6 +112,33 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def load_repo_env() -> None:
+    for env_path in DEFAULT_ENV_FILES:
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+
+
+def configure_wandb(project: str, run_name: str | None) -> list[str]:
+    api_key = os.environ.get("WANDB_API_KEY", "").strip()
+    if not api_key:
+        os.environ["WANDB_DISABLED"] = "true"
+        return []
+
+    os.environ["WANDB_DISABLED"] = "false"
+    os.environ.setdefault("WANDB_PROJECT", project)
+    if run_name:
+        os.environ.setdefault("WANDB_NAME", run_name)
+    return ["wandb"]
 
 
 def format_observation(obs: KubemedicObservation) -> str:
@@ -465,11 +494,13 @@ def infer_lora_target_modules(model: AutoModelForCausalLM) -> list[str]:
 
 def main() -> None:
     args = parse_args()
+    load_repo_env()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     scenarios = [item.strip() for item in args.scenario_list.split(",") if item.strip()]
 
     set_seed(args.seed)
+    report_to = configure_wandb(args.wandb_project, args.wandb_run_name)
     if not args.skip_smoke_test:
         smoke_test(args.env_url, scenarios[0])
     if args.smoke_only:
@@ -537,7 +568,7 @@ def main() -> None:
         fp16=(dtype == torch.float16),
         gradient_checkpointing=True,
         remove_unused_columns=False,
-        report_to=[],
+        report_to=report_to,
         use_vllm=use_vllm,
         vllm_mode=args.vllm_mode,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
