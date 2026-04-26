@@ -1,52 +1,206 @@
-"""Single-session GRPO training entrypoint for KubeMedic."""
+"""KubeMedic GRPO training (self-contained, no parameters).
+
+Run it directly with `python training.py`. The script:
+  1. Ensures system deps (clones the KubeMedic Space, pins trl/datasets, installs unsloth).
+  2. Loads `.env`, configures wandb, and primes A100-friendly torch backends.
+  3. Loads `unsloth/gemma-4-E2B-it` (with vLLM + LoRA via unsloth) and runs GRPO for 5 epochs.
+  4. Stores all results under `outputs/kubemedic-gemma-4-E2B-grpo/`:
+       - `episode_rewards.csv`, `agent_transcripts.jsonl`, `trainer_log_history.csv`
+       - `reward_plot.png`, `trainer_metrics.png`, `training_summary.json`
+       - `adapter/` (LoRA weights + tokenizer)
+     and pushes a wandb run under `kubemedic-grpo-gemma-4-E2B`.
+
+Skip the install pass on subsequent runs by exporting `KUBEMEDIC_SKIP_INSTALL=1`.
+"""
 
 from __future__ import annotations
 
-import argparse
+import contextlib
 import csv
 import json
-import math
 import os
 import random
 import shlex
+import shutil
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
+# --------------------------------------------------------------------------- #
+# 1. Dependency bootstrap (cell 2 in the notebook).                           #
+# --------------------------------------------------------------------------- #
+
+SPACE_ID = "ashiqabdulkhader/Kubemedic"
+SPACE_URL = f"https://huggingface.co/spaces/{SPACE_ID}.git"
+KUBEMEDIC_SRC = "/tmp/kubemedic-src"
+WANDB_API_KEY_LITERAL = (
+    "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"
+)
+
+
+def _pip(*args: str) -> None:
+    cmd = [sys.executable, "-m", "pip", "install", "-q", *args]
+    print("$", " ".join(shlex.quote(a) for a in cmd))
+    subprocess.check_call(cmd)
+
+
+def _ensure_dependencies() -> None:
+    if os.environ.get("KUBEMEDIC_SKIP_INSTALL", "").strip() in {"1", "true", "TRUE"}:
+        print("KUBEMEDIC_SKIP_INSTALL set; skipping dependency bootstrap.")
+        return
+
+    if os.path.isdir(KUBEMEDIC_SRC):
+        shutil.rmtree(KUBEMEDIC_SRC)
+    print("Cloning Space:", SPACE_URL)
+    subprocess.check_call(["git", "clone", "--depth", "1", SPACE_URL, KUBEMEDIC_SRC])
+
+    _pip("-U", "numpy>=2.0,<3")
+    _pip("-U", "wandb>=0.17.0", "nbformat>=5.10", "hf_transfer>=0.1.6")
+    _pip("-U", f"{KUBEMEDIC_SRC}[train]")
+    _pip("--force-reinstall", "trl>=0.18.2,<=0.24.0", "datasets>=3.4.1,<4.4.0")
+    _pip("-U", "--no-deps", "--force-reinstall", "unsloth", "unsloth_zoo")
+
+    cache_dir = os.path.expanduser("~/unsloth_compiled_cache")
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        print("Cleared ~/unsloth_compiled_cache so GRPO patches recompile against pinned trl.")
+
+
+_ensure_dependencies()
+
+
+# --------------------------------------------------------------------------- #
+# 2. Environment setup (cell 4 in the notebook).                              #
+# --------------------------------------------------------------------------- #
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+os.chdir(SCRIPT_DIR)
+
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "kubemedic-mpl"))
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
+os.environ.setdefault("WANDB_DISABLED", "false")
+os.environ.setdefault("WANDB_NOTEBOOK_NAME", "kubemedic_training.py")
+os.environ.setdefault("WANDB_SAVE_CODE", "false")
+os.environ["WANDB_API_KEY"] = os.environ.get("WANDB_API_KEY") or WANDB_API_KEY_LITERAL
 
-import matplotlib
+for env_path in (SCRIPT_DIR / ".env", SCRIPT_DIR.parent / ".env"):
+    if not env_path.exists():
+        continue
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+if not os.environ.get("HF_TOKEN"):
+    try:
+        os.environ["HF_TOKEN"] = subprocess.check_output(["hf", "auth", "token"], text=True).strip()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# 3. Unsloth import — must happen before torch / trl / transformers.          #
+# --------------------------------------------------------------------------- #
+
+try:
+    from unsloth import FastLanguageModel  # type: ignore[import-not-found]
+
+    UNSLOTH_AVAILABLE = True
+    try:
+        from unsloth import FastModel  # type: ignore[import-not-found]
+    except ImportError:
+        FastModel = None
+    try:
+        from unsloth import PatchFastRL  # type: ignore[import-not-found]
+
+        PatchFastRL("GRPO", FastLanguageModel)
+        print("unsloth loaded; GRPO patches applied via PatchFastRL.")
+    except ImportError:
+        print("unsloth loaded; relying on unsloth_zoo auto-patches (no PatchFastRL).")
+    except Exception as patch_exc:
+        print(f"unsloth loaded; PatchFastRL skipped ({patch_exc}); auto-patches still active.")
+except Exception as exc:
+    print(f"unsloth unavailable ({exc}); falling back to standard transformers loading.")
+    FastLanguageModel = None
+    FastModel = None
+    UNSLOTH_AVAILABLE = False
+
+
+# --------------------------------------------------------------------------- #
+# 4. Heavy imports.                                                            #
+# --------------------------------------------------------------------------- #
+
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
-import pandas as pd
-import seaborn as sns
-import torch
-import transformers
-from datasets import Dataset
-from packaging.version import Version
-from peft import LoraConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from trl import GRPOConfig, GRPOTrainer
-from trl.experimental.openenv import generate_rollout_completions
+import matplotlib.pyplot as plt  # noqa: E402
+import pandas as pd  # noqa: E402
+import seaborn as sns  # noqa: E402
+import torch  # noqa: E402
+import transformers  # noqa: E402
+import wandb  # noqa: E402
+from datasets import Dataset  # noqa: E402
+from packaging.version import Version  # noqa: E402
+from peft import LoraConfig  # noqa: E402
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig  # noqa: E402
+from trl import GRPOConfig, GRPOTrainer  # noqa: E402
+from trl.experimental.openenv import generate_rollout_completions  # noqa: E402
+
+from Kubemedic import KubemedicAction, KubemedicEnv, KubemedicObservation  # noqa: E402
+from Kubemedic.models import ToolName  # noqa: E402
 
 try:
-    from .client import KubemedicEnv
-    from .models import KubemedicAction, KubemedicObservation, ToolName
-except ImportError:
-    # Allow running as a direct script from notebooks/local paths.
-    from client import KubemedicEnv
-    from models import KubemedicAction, KubemedicObservation, ToolName
-
-try:
-    from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
-except Exception:  # pragma: no cover - optional runtime dependency path
+    from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK  # noqa: E402
+except Exception:
     ConnectionClosedError = Exception
     ConnectionClosedOK = Exception
+
+
+# --------------------------------------------------------------------------- #
+# 5. Configuration (cell 6).                                                  #
+# --------------------------------------------------------------------------- #
+
+ENV_URL = f"https://{SPACE_ID.replace('/', '-')}.hf.space"
+MODEL_ID = "unsloth/gemma-4-E2B-it"
+OUTPUT_DIR = Path("outputs/kubemedic-gemma-4-E2B-grpo")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TRAIN_EPISODES = 16
+EVAL_EPISODES = 2
+NUM_EPOCHS = 5
+NUM_GENERATIONS = 4
+PER_DEVICE_TRAIN_BATCH_SIZE = 8
+GRADIENT_ACCUMULATION_STEPS = 1
+LEARNING_RATE = 1e-5
+MAX_COMPLETION_LENGTH = 512
+MAX_TURNS = 8
+SAVE_STEPS = 4
+LOGGING_STEPS = 1
+SEED = 42
+VLLM_MODE = "colocate"
+VLLM_GPU_MEMORY_UTILIZATION = 0.5
+USE_4BIT = False
+USE_VLLM = True
+USE_UNSLOTH = True
+USE_GRADIENT_CHECKPOINTING = False
+USE_FLASH_ATTENTION = True
+MAX_SEQ_LENGTH = 2048
+LORA_RANK = 16
+SKIP_SMOKE_TEST = False
+WANDB_PROJECT = "kubemedic-grpo-gemma-4-E2B"
+WANDB_RUN_NAME = None
+SCENARIOS = ["KUBE-01", "KUBE-03", "KUBE-04", "KUBE-05", "KUBE-06"]
+
+CONNECT_TIMEOUT_S = 30.0
+MESSAGE_TIMEOUT_S = 240.0
+VALID_TOOLS = set(ToolName.__args__)  # type: ignore[attr-defined]
 
 SYSTEM_PROMPT = """You are a Kubernetes SRE agent operating KubeMedic.
 Diagnose the cluster carefully, use the available actions, minimize blast radius, and stop once the cluster is healthy.
@@ -77,39 +231,11 @@ Rules:
 TRAINING_HINT = (
     "Diagnose and repair this Kubernetes incident. Output one action only, in the required syntax."
 )
-DEFAULT_SCENARIOS = ["KUBE-01", "KUBE-03", "KUBE-04", "KUBE-05", "KUBE-06"]
-VALID_TOOLS = set(ToolName.__args__)  # type: ignore[attr-defined]
-CONNECT_TIMEOUT_S = 30.0
-MESSAGE_TIMEOUT_S = 240.0
-DEFAULT_ENV_FILES = [Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a single-session GRPO KubeMedic agent.")
-    parser.add_argument("--env-url", required=True, help="OpenEnv base URL for the KubeMedic server.")
-    parser.add_argument("--model-id", default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument("--output-dir", default="outputs/kubemedic-qwen25-3b-grpo")
-    parser.add_argument("--train-episodes", type=int, default=8)
-    parser.add_argument("--eval-episodes", type=int, default=2)
-    parser.add_argument("--num-generations", type=int, default=2)
-    parser.add_argument("--per-device-train-batch-size", type=int, default=2)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--max-completion-length", type=int, default=256)
-    parser.add_argument("--max-turns", type=int, default=8)
-    parser.add_argument("--save-steps", type=int, default=4)
-    parser.add_argument("--logging-steps", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--vllm-mode", choices=["colocate", "server"], default="colocate")
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.35)
-    parser.add_argument("--no-vllm", action="store_true")
-    parser.add_argument("--no-4bit", action="store_true")
-    parser.add_argument("--skip-smoke-test", action="store_true")
-    parser.add_argument("--smoke-only", action="store_true")
-    parser.add_argument("--scenario-list", default=",".join(DEFAULT_SCENARIOS))
-    parser.add_argument("--wandb-project", default="kubemedic-grpo")
-    parser.add_argument("--wandb-run-name", default=None)
-    return parser.parse_args()
+# --------------------------------------------------------------------------- #
+# 6. Helper functions (cell 8).                                               #
+# --------------------------------------------------------------------------- #
 
 
 def set_seed(seed: int) -> None:
@@ -119,31 +245,35 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_repo_env() -> None:
-    for env_path in DEFAULT_ENV_FILES:
-        if not env_path.exists():
-            continue
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            os.environ.setdefault(key, value)
-
-
 def configure_wandb(project: str, run_name: str | None) -> list[str]:
     api_key = os.environ.get("WANDB_API_KEY", "").strip()
     if not api_key:
         os.environ["WANDB_DISABLED"] = "true"
+        print("WANDB_API_KEY not set; wandb disabled.")
         return []
-
     os.environ["WANDB_DISABLED"] = "false"
     os.environ.setdefault("WANDB_PROJECT", project)
     if run_name:
         os.environ.setdefault("WANDB_NAME", run_name)
+    try:
+        wandb.login(key=api_key, relogin=True)
+        msg = f"wandb authenticated; project={os.environ['WANDB_PROJECT']}"
+        if os.environ.get("WANDB_NAME"):
+            msg += f" run={os.environ['WANDB_NAME']}"
+        print(msg)
+    except Exception as exc:
+        print("wandb.login failed:", exc, "-- disabling wandb for this run.")
+        os.environ["WANDB_DISABLED"] = "true"
+        return []
     return ["wandb"]
+
+
+def make_env(env_url: str):
+    return KubemedicEnv(
+        base_url=env_url,
+        connect_timeout_s=CONNECT_TIMEOUT_S,
+        message_timeout_s=MESSAGE_TIMEOUT_S,
+    ).sync()
 
 
 def format_observation(obs: KubemedicObservation) -> str:
@@ -165,7 +295,9 @@ def format_observation(obs: KubemedicObservation) -> str:
 
     info = obs.info or {}
     reward_breakdown = info.get("reward_breakdown", {})
-    breakdown_text = ", ".join(f"{k}={v:.2f}" for k, v in reward_breakdown.items()) if reward_breakdown else "none"
+    breakdown_text = (
+        ", ".join(f"{k}={v:.2f}" for k, v in reward_breakdown.items()) if reward_breakdown else "none"
+    )
 
     return (
         f"{TRAINING_HINT}\n\n"
@@ -198,7 +330,7 @@ def coerce_value(value: str) -> Any:
         return True
     if lowered == "false":
         return False
-    if lowered == "none" or lowered == "null":
+    if lowered in ("none", "null"):
         return None
     try:
         return json.loads(value)
@@ -215,7 +347,7 @@ def parse_action_text(text: str) -> KubemedicAction | None:
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`").strip()
-    line = cleaned.splitlines()[0].strip()
+    line = cleaned.splitlines()[0].strip() if cleaned else ""
     if not line:
         return None
 
@@ -247,22 +379,19 @@ def parse_action_text(text: str) -> KubemedicAction | None:
     return KubemedicAction(tool=tool, args=args)
 
 
-def build_dataset(num_rows: int) -> Dataset:
-    rows = [{"prompt": TRAINING_HINT} for _ in range(num_rows)]
-    return Dataset.from_list(rows)
-
-
-def make_env(env_url: str):
-    return KubemedicEnv(
-        base_url=env_url,
-        connect_timeout_s=CONNECT_TIMEOUT_S,
-        message_timeout_s=MESSAGE_TIMEOUT_S,
-    ).sync()
-
-
-def render_prompt(tokenizer: AutoTokenizer, messages: list[dict[str, str]]) -> str:
+def render_prompt(tokenizer, messages: list[dict[str, str]]) -> str:
     if getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
     system_lines = [msg["content"] for msg in messages if msg["role"] == "system"]
     user_lines = [msg["content"] for msg in messages if msg["role"] == "user"]
     return "\n\n".join(
@@ -285,23 +414,40 @@ def is_connection_error(exc: Exception) -> bool:
     )
 
 
-def smoke_test(env_url: str, scenario: str) -> None:
-    env = make_env(env_url)
-    try:
-        result = env.reset(scenario=scenario)
-        print(format_observation(result.observation)[:1200])
-        step_result = env.step(KubemedicAction(tool="kubectl_get", args={"resource": "pods", "namespace": "challenge"}))
-        print("\n--- smoke tool call ---\n")
-        print(format_observation(step_result.observation)[:1200])
-        print("\nSmoke test passed.")
-    finally:
-        env.close()
+def build_dataset(num_rows: int) -> Dataset:
+    rows = [{"prompt": TRAINING_HINT} for _ in range(num_rows)]
+    return Dataset.from_list(rows)
 
 
-def generate_rollout_completions_local(
-    trainer: GRPOTrainer,
-    prompts: list[str],
-) -> list[dict[str, Any]]:
+def infer_lora_target_modules(model) -> list[str]:
+    model_type = getattr(model.config, "model_type", "")
+    if model_type in {"qwen2", "qwen2_5", "qwen3"}:
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    if model_type in {"gpt2"}:
+        return ["c_attn", "c_proj", "c_fc"]
+    module_names = {name.split(".")[-1] for name, _ in model.named_modules()}
+    preferred = [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+        "c_attn", "c_proj", "c_fc",
+    ]
+    inferred = [name for name in preferred if name in module_names]
+    if inferred:
+        return inferred
+    raise ValueError(f"Could not infer LoRA target modules for model_type={model_type!r}.")
+
+
+def reward_total(completions: list[str], **kwargs) -> list[float]:
+    rewards = kwargs.get("total_reward") if kwargs else None
+    return [float(value) for value in rewards] if rewards else [0.0 for _ in completions]
+
+
+# --------------------------------------------------------------------------- #
+# 7. Rollout helpers (cell 10).                                               #
+# --------------------------------------------------------------------------- #
+
+
+def generate_rollout_completions_local(trainer: GRPOTrainer, prompts: list[str]) -> list[dict[str, Any]]:
     tokenizer = trainer.processing_class
     model = trainer.model
     results: list[dict[str, Any]] = []
@@ -342,14 +488,13 @@ def generate_rollout_completions_local(
                 "text": tokenizer.decode(completion_ids, skip_special_tokens=True),
             }
         )
-
     return results
 
 
 def rollout_once(
     trainer: GRPOTrainer,
     env_url: str,
-    tokenizer: AutoTokenizer,
+    tokenizer,
     scenario: str,
     max_turns: int,
     max_total_tokens: int,
@@ -367,6 +512,10 @@ def rollout_once(
             logprobs: list[float] = []
             step_rewards: list[float] = []
             history: list[dict[str, Any]] = []
+            valid_actions = 0
+            total_actions = 0
+            tool_usage: dict[str, int] = {}
+            sample_completion = ""
 
             for _ in range(max_turns):
                 if result.done or len(completion_ids) >= max_total_tokens:
@@ -391,6 +540,9 @@ def rollout_once(
                 logprobs.extend([float(v) for v in rollout_output["logprobs"]])
 
                 completion_text = (rollout_output.get("text") or "").strip()
+                if not sample_completion:
+                    sample_completion = completion_text[:600]
+                total_actions += 1
                 action = parse_action_text(completion_text)
                 if action is None:
                     step_rewards.append(-1.0)
@@ -403,6 +555,8 @@ def rollout_once(
                     )
                     continue
 
+                valid_actions += 1
+                tool_usage[action.tool] = tool_usage.get(action.tool, 0) + 1
                 result = env.step(action)
                 observation = result.observation
                 reward = float(result.reward or 0.0)
@@ -411,14 +565,30 @@ def rollout_once(
                 history.append({"action": completion_text, "output": tool_output, "reward": reward})
 
             total_reward = sum(step_rewards) if step_rewards else -1.0
+            mean_step_reward = (total_reward / len(step_rewards)) if step_rewards else 0.0
+            min_step_reward = min(step_rewards) if step_rewards else 0.0
+            max_step_reward = max(step_rewards) if step_rewards else 0.0
+            valid_action_rate = (valid_actions / total_actions) if total_actions else 0.0
+            mean_logprob = (sum(logprobs) / len(logprobs)) if logprobs else 0.0
             return {
                 "prompt_ids": prompt_ids,
                 "completion_ids": completion_ids,
                 "logprobs": logprobs,
                 "total_reward": total_reward,
+                "mean_step_reward": mean_step_reward,
+                "min_step_reward": min_step_reward,
+                "max_step_reward": max_step_reward,
+                "mean_logprob": mean_logprob,
+                "completion_tokens": len(completion_ids),
+                "prompt_tokens": len(prompt_ids),
                 "steps": len(step_rewards),
                 "scenario": scenario,
                 "resolved": bool(result.done),
+                "valid_actions": valid_actions,
+                "total_actions": total_actions,
+                "valid_action_rate": valid_action_rate,
+                "tool_usage": tool_usage,
+                "sample_completion": sample_completion,
             }
         except Exception as exc:
             last_exc = exc
@@ -439,9 +609,29 @@ def rollout_once(
     raise RuntimeError(f"Episode failed after {max_retries} reconnect attempts: {last_exc}")
 
 
-def reward_total(completions: list[str], **kwargs) -> list[float]:
-    rewards = kwargs.get("total_reward") if kwargs else None
-    return [float(value) for value in rewards] if rewards else [0.0 for _ in completions]
+# --------------------------------------------------------------------------- #
+# 8. Smoke test (cell 12).                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def smoke_test(env_url: str, scenario: str) -> None:
+    env = make_env(env_url)
+    try:
+        result = env.reset(scenario=scenario)
+        print(format_observation(result.observation)[:1200])
+        step_result = env.step(
+            KubemedicAction(tool="kubectl_get", args={"resource": "pods", "namespace": "challenge"})
+        )
+        print("\n--- smoke tool call ---\n")
+        print(format_observation(step_result.observation)[:1200])
+        print("\nSmoke test passed.")
+    finally:
+        env.close()
+
+
+# --------------------------------------------------------------------------- #
+# 9. Plotting (cell 18).                                                      #
+# --------------------------------------------------------------------------- #
 
 
 def plot_rewards(csv_path: Path, out_path: Path) -> None:
@@ -482,114 +672,352 @@ def plot_trainer_metrics(log_history: pd.DataFrame, out_path: Path) -> None:
     plt.close(fig)
 
 
-def infer_lora_target_modules(model: AutoModelForCausalLM) -> list[str]:
-    model_type = getattr(model.config, "model_type", "")
-    if model_type in {"qwen2", "qwen2_5", "qwen3"}:
-        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    if model_type in {"gpt2"}:
-        return ["c_attn", "c_proj", "c_fc"]
+# --------------------------------------------------------------------------- #
+# 10. wandb safety helpers (cell 16).                                         #
+# --------------------------------------------------------------------------- #
 
-    module_names = {name.split(".")[-1] for name, _ in model.named_modules()}
-    preferred = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "c_attn", "c_proj", "c_fc"]
-    inferred = [name for name in preferred if name in module_names]
-    if inferred:
-        return inferred
-    raise ValueError(f"Could not infer LoRA target modules for model_type={model_type!r}.")
+_WANDB_STATE = {"warned": False, "broken": False}
+
+
+@contextlib.contextmanager
+def _wandb_guard(label: str = "log"):
+    """Swallow any wandb exception so it never crashes training."""
+    if wandb is None or _WANDB_STATE["broken"]:
+        yield
+        return
+    try:
+        yield
+    except Exception as exc:
+        if not _WANDB_STATE["warned"]:
+            print(f"[wandb] {label} failed: {exc}. Suppressing further wandb errors so training can continue.")
+            _WANDB_STATE["warned"] = True
+        if isinstance(exc, (RuntimeError, OSError)):
+            _WANDB_STATE["broken"] = True
+
+
+def _wandb_active() -> bool:
+    if wandb is None or _WANDB_STATE["broken"]:
+        return False
+    try:
+        return wandb.run is not None
+    except Exception:
+        return False
+
+
+def _strip_wandb_callback(trainer: GRPOTrainer) -> None:
+    handler = getattr(trainer, "callback_handler", None)
+    if handler is None:
+        return
+    handler.callbacks = [cb for cb in handler.callbacks if cb.__class__.__name__ != "WandbCallback"]
+
+
+def _wrap_callback_method(trainer: GRPOTrainer, method_name: str) -> None:
+    handler = getattr(trainer, "callback_handler", None)
+    if handler is None:
+        return
+    for cb in list(handler.callbacks):
+        if cb.__class__.__name__ != "WandbCallback":
+            continue
+        original = getattr(cb, method_name, None)
+        if not callable(original):
+            continue
+
+        def _safe(*args, _orig=original, **kwargs):
+            with _wandb_guard(f"callback.{method_name}"):
+                return _orig(*args, **kwargs)
+            if _WANDB_STATE["broken"]:
+                _strip_wandb_callback(trainer)
+
+        setattr(cb, method_name, _safe)
+
+
+def _safe_wandb_finish() -> None:
+    try:
+        if wandb.run is not None:
+            wandb.finish(exit_code=1, quiet=True)
+    except Exception as exc:
+        print(f"[wandb] finish failed (ignored): {exc}")
+
+
+# --------------------------------------------------------------------------- #
+# 11. main — runs the full pipeline end-to-end (cells 14, 16, 18, 20).        #
+# --------------------------------------------------------------------------- #
 
 
 def main() -> None:
-    args = parse_args()
-    load_repo_env()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    scenarios = [item.strip() for item in args.scenario_list.split(",") if item.strip()]
+    print("=== KubeMedic GRPO training (script mode) ===")
+    print("Kernel python   :", sys.executable)
+    print("Torch version   :", torch.__version__)
+    print("CUDA available  :", torch.cuda.is_available())
+    print("Unsloth         :", UNSLOTH_AVAILABLE)
+    print("HF token loaded :", bool(os.environ.get("HF_TOKEN")))
+    print("WANDB key loaded:", bool(os.environ.get("WANDB_API_KEY")))
+    print("ENV_URL   :", ENV_URL)
+    print("MODEL_ID  :", MODEL_ID)
+    print("OUTPUT_DIR:", OUTPUT_DIR.resolve())
+    print("SCENARIOS :", SCENARIOS)
 
-    set_seed(args.seed)
-    report_to = configure_wandb(args.wandb_project, args.wandb_run_name)
-    if not args.skip_smoke_test:
-        smoke_test(args.env_url, scenarios[0])
-    if args.smoke_only:
-        return
-    if args.per_device_train_batch_size % args.num_generations != 0:
-        raise ValueError("per_device_train_batch_size must be divisible by num_generations for GRPO.")
+    # ----------- preflight ---------------------------------------------------
+    if PER_DEVICE_TRAIN_BATCH_SIZE % NUM_GENERATIONS != 0:
+        raise ValueError("PER_DEVICE_TRAIN_BATCH_SIZE must be divisible by NUM_GENERATIONS for GRPO.")
+    if Version(transformers.__version__) < Version("4.56.0"):
+        raise RuntimeError("transformers>=4.56.0 is required for the training entrypoint.")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    set_seed(SEED)
+    report_to = configure_wandb(WANDB_PROJECT, WANDB_RUN_NAME)
 
-    use_vllm = torch.cuda.is_available() and not args.no_vllm
+    if not SKIP_SMOKE_TEST:
+        smoke_test(ENV_URL, SCENARIOS[0])
+    else:
+        print("Skipping smoke test.")
+
+    # ----------- A100 backend tuning ----------------------------------------
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    use_vllm = torch.cuda.is_available() and USE_VLLM
     if torch.cuda.is_available():
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     else:
         dtype = torch.float32
+    use_unsloth = bool(USE_UNSLOTH and UNSLOTH_AVAILABLE and torch.cuda.is_available())
+    lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    attn_impl = "sdpa" if USE_FLASH_ATTENTION else "eager"
+
+    # ----------- model + tokenizer ------------------------------------------
+    model = None
+    tokenizer = None
+    peft_config: LoraConfig | None = None
     quant_config = None
-    if torch.cuda.is_available() and not args.no_4bit:
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=dtype,
-            bnb_4bit_use_double_quant=True,
+
+    if use_unsloth:
+        if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1":
+            try:
+                import hf_transfer  # noqa: F401
+            except Exception:
+                print("hf_transfer not importable; disabling HF_HUB_ENABLE_HF_TRANSFER for this run.")
+                os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        use_fast_model = ("gemma" in MODEL_ID.lower() and FastModel is not None)
+        loader = FastModel if use_fast_model else FastLanguageModel
+        from_pretrained_kwargs: dict[str, Any] = dict(
+            model_name=MODEL_ID,
+            max_seq_length=MAX_SEQ_LENGTH,
+            dtype=dtype,
+            load_in_4bit=USE_4BIT,
         )
+        if use_vllm:
+            from_pretrained_kwargs.update(
+                fast_inference=True,
+                max_lora_rank=LORA_RANK,
+                gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
+            )
+        try:
+            try:
+                model, tokenizer = loader.from_pretrained(**from_pretrained_kwargs)
+            except TypeError as kwarg_exc:
+                if use_vllm:
+                    print(
+                        f"unsloth loader does not accept fast_inference kwargs ({kwarg_exc}); "
+                        "retrying without vLLM fast-inference."
+                    )
+                    for k in ("fast_inference", "max_lora_rank", "gpu_memory_utilization"):
+                        from_pretrained_kwargs.pop(k, None)
+                    model, tokenizer = loader.from_pretrained(**from_pretrained_kwargs)
+                    use_vllm = False
+                else:
+                    raise
+            peft_kwargs: dict[str, Any] = dict(
+                r=LORA_RANK,
+                target_modules=lora_target_modules,
+                lora_alpha=LORA_RANK * 2,
+                lora_dropout=0.05,
+                bias="none",
+                use_gradient_checkpointing=("unsloth" if USE_GRADIENT_CHECKPOINTING else False),
+                random_state=SEED,
+                use_rslora=False,
+                loftq_config=None,
+            )
+            if use_fast_model:
+                peft_kwargs.update(
+                    finetune_vision_layers=False,
+                    finetune_language_layers=True,
+                    finetune_attention_modules=True,
+                    finetune_mlp_modules=True,
+                )
+            model = loader.get_peft_model(model, **peft_kwargs)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            print("Loader    :", "unsloth.FastModel" if use_fast_model else "unsloth.FastLanguageModel")
+            print("LoRA tgts :", lora_target_modules)
+        except Exception as exc:
+            print(f"unsloth loader failed at runtime ({exc}); falling back to standard transformers path.")
+            use_unsloth = False
+            model = None
+            tokenizer = None
 
-    model_kwargs: dict[str, Any] = {
-        "torch_dtype": dtype,
-        "quantization_config": quant_config,
-    }
-    if torch.cuda.is_available():
-        model_kwargs["device_map"] = "auto"
+    if not use_unsloth:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        **model_kwargs,
-    )
+        if torch.cuda.is_available() and USE_4BIT:
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_use_double_quant=True,
+            )
 
-    if Version(transformers.__version__) < Version("4.56.0"):
-        raise RuntimeError("transformers>=4.56.0 is required for the training entrypoint.")
+        model_kwargs: dict[str, Any] = {
+            "torch_dtype": dtype,
+            "quantization_config": quant_config,
+            "attn_implementation": attn_impl,
+        }
+        if torch.cuda.is_available():
+            model_kwargs["device_map"] = "auto"
 
-    train_dataset = build_dataset(args.train_episodes)
-    eval_dataset = build_dataset(args.eval_episodes)
+        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
+        peft_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=infer_lora_target_modules(model),
+        )
+        print("Loader    : transformers.AutoModelForCausalLM")
+        print("LoRA tgts :", peft_config.target_modules)
 
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=infer_lora_target_modules(model),
-    )
+    print("use_vllm  :", use_vllm)
+    print("use_unsloth:", use_unsloth)
+    print("attn impl :", attn_impl)
+    print("dtype     :", dtype)
+    print("4-bit     :", USE_4BIT and torch.cuda.is_available())
+    print("grad ckpt :", USE_GRADIENT_CHECKPOINTING)
 
-    grpo_config = GRPOConfig(
-        output_dir=str(output_dir),
-        learning_rate=args.learning_rate,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_generations=args.num_generations,
-        max_completion_length=args.max_completion_length,
-        num_train_epochs=1,
-        save_steps=args.save_steps,
-        logging_steps=args.logging_steps,
+    # ----------- datasets + GRPOConfig --------------------------------------
+    train_dataset = build_dataset(TRAIN_EPISODES)
+    eval_dataset = build_dataset(EVAL_EPISODES)
+
+    trainer_grad_ckpt = bool(USE_GRADIENT_CHECKPOINTING and not use_unsloth)
+    grpo_config_kwargs = dict(
+        output_dir=str(OUTPUT_DIR),
+        learning_rate=LEARNING_RATE,
+        per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        num_generations=NUM_GENERATIONS,
+        max_completion_length=MAX_COMPLETION_LENGTH,
+        num_train_epochs=NUM_EPOCHS,
+        save_steps=SAVE_STEPS,
+        logging_steps=LOGGING_STEPS,
         save_total_limit=2,
         bf16=(dtype == torch.bfloat16),
         fp16=(dtype == torch.float16),
-        gradient_checkpointing=True,
+        tf32=torch.cuda.is_available(),
+        gradient_checkpointing=trainer_grad_ckpt,
         remove_unused_columns=False,
         report_to=report_to,
         use_vllm=use_vllm,
-        vllm_mode=args.vllm_mode,
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        log_completions=False,
+        vllm_mode=VLLM_MODE,
+        vllm_gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
+        log_completions=True,
         max_tool_calling_iterations=1,
-        seed=args.seed,
+        seed=SEED,
+        optim="adamw_torch_fused",
+        dataloader_num_workers=2,
+        dataloader_pin_memory=True,
     )
+    try:
+        grpo_config = GRPOConfig(**grpo_config_kwargs)
+    except TypeError as exc:
+        print(f"GRPOConfig rejected an A100 kwarg ({exc}); retrying with the safe subset.")
+        for k in ("tf32", "optim", "dataloader_num_workers", "dataloader_pin_memory"):
+            grpo_config_kwargs.pop(k, None)
+        grpo_config = GRPOConfig(**grpo_config_kwargs)
 
-    reward_log_path = output_dir / "episode_rewards.csv"
-    transcript_path = output_dir / "agent_transcripts.jsonl"
+    # ----------- result file scaffolding ------------------------------------
+    reward_log_path = OUTPUT_DIR / "episode_rewards.csv"
+    transcript_path = OUTPUT_DIR / "agent_transcripts.jsonl"
+    if transcript_path.exists():
+        transcript_path.unlink()
     with reward_log_path.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["episode", "scenario", "total_reward", "steps", "resolved"])
 
-    episode_counter = {"value": 0}
+    # ----------- wandb run + episode table ----------------------------------
+    if wandb is not None and "wandb" in report_to and not _wandb_active():
+        with _wandb_guard("init"):
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", WANDB_PROJECT),
+                name=os.environ.get("WANDB_NAME", WANDB_RUN_NAME),
+                config={
+                    "model_id": MODEL_ID,
+                    "env_url": ENV_URL,
+                    "train_episodes": TRAIN_EPISODES,
+                    "eval_episodes": EVAL_EPISODES,
+                    "num_epochs": NUM_EPOCHS,
+                    "num_generations": NUM_GENERATIONS,
+                    "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
+                    "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+                    "learning_rate": LEARNING_RATE,
+                    "max_completion_length": MAX_COMPLETION_LENGTH,
+                    "max_turns": MAX_TURNS,
+                    "use_vllm": use_vllm,
+                    "vllm_mode": VLLM_MODE,
+                    "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
+                    "use_4bit": USE_4BIT,
+                    "use_unsloth": use_unsloth,
+                    "use_gradient_checkpointing": bool(USE_GRADIENT_CHECKPOINTING),
+                    "attn_implementation": attn_impl,
+                    "lora_rank": LORA_RANK,
+                    "seed": SEED,
+                    "scenarios": SCENARIOS,
+                },
+                tags=["kubemedic", "grpo", "gemma-4", "gemma-4-E2B"],
+                save_code=False,
+                reinit="finish_previous",
+            )
+        if _wandb_active():
+            try:
+                print("wandb run:", wandb.run.url)
+            except Exception:
+                print("wandb run: (active, url unavailable)")
+        else:
+            print("wandb run: (disabled)")
 
+    episode_counter = {"value": 0}
+    episode_table = None
+    if _wandb_active():
+        with _wandb_guard("Table.init"):
+            episode_table = wandb.Table(
+                columns=[
+                    "episode", "scenario", "total_reward", "mean_step_reward",
+                    "min_step_reward", "max_step_reward", "steps", "resolved",
+                    "valid_action_rate", "completion_tokens", "prompt_tokens",
+                    "mean_logprob", "top_tool", "sample_completion",
+                ]
+            )
+
+    roll_window = 32
+    recent_rewards: list[float] = []
+    recent_resolved: list[int] = []
+    recent_steps: list[int] = []
+    recent_valid_rate: list[float] = []
+    scenario_rewards: dict[str, list[float]] = {s: [] for s in SCENARIOS}
+
+    def running_mean(values: list[float], window: int) -> float:
+        if not values:
+            return 0.0
+        tail = values[-window:]
+        return sum(tail) / len(tail)
+
+    # ----------- rollout func -----------------------------------------------
     def rollout_func(prompts: list[str], trainer: GRPOTrainer) -> dict[str, list]:
         prompt_count = len(prompts)
         episode_prompt_ids: list[list[int]] = []
@@ -600,16 +1028,16 @@ def main() -> None:
         scenario_names: list[str] = []
         resolved_flags: list[bool] = []
 
-        for start in range(0, prompt_count, args.num_generations):
-            scenario = random.choice(scenarios)
-            group_size = min(args.num_generations, prompt_count - start)
+        for start in range(0, prompt_count, NUM_GENERATIONS):
+            scenario = random.choice(SCENARIOS)
+            group_size = min(NUM_GENERATIONS, prompt_count - start)
             for _ in range(group_size):
                 episode = rollout_once(
                     trainer=trainer,
-                    env_url=args.env_url,
+                    env_url=ENV_URL,
                     tokenizer=tokenizer,
                     scenario=scenario,
-                    max_turns=args.max_turns,
+                    max_turns=MAX_TURNS,
                     max_total_tokens=4096,
                 )
                 episode_prompt_ids.append(episode["prompt_ids"])
@@ -635,6 +1063,74 @@ def main() -> None:
                 with transcript_path.open("a") as handle:
                     handle.write(json.dumps(episode) + "\n")
 
+                recent_rewards.append(float(episode["total_reward"]))
+                recent_resolved.append(int(bool(episode["resolved"])))
+                recent_steps.append(int(episode["steps"]))
+                recent_valid_rate.append(float(episode["valid_action_rate"]))
+                scenario_rewards.setdefault(episode["scenario"], []).append(
+                    float(episode["total_reward"])
+                )
+
+                if _wandb_active():
+                    scenario_index = (
+                        SCENARIOS.index(episode["scenario"])
+                        if episode["scenario"] in SCENARIOS
+                        else -1
+                    )
+                    tool_usage = episode.get("tool_usage") or {}
+                    top_tool = max(tool_usage.items(), key=lambda kv: kv[1])[0] if tool_usage else ""
+
+                    log_payload = {
+                        "rollout/episode": episode_counter["value"],
+                        "rollout/total_reward": float(episode["total_reward"]),
+                        "rollout/mean_step_reward": float(episode["mean_step_reward"]),
+                        "rollout/min_step_reward": float(episode["min_step_reward"]),
+                        "rollout/max_step_reward": float(episode["max_step_reward"]),
+                        "rollout/mean_logprob": float(episode["mean_logprob"]),
+                        "rollout/steps": int(episode["steps"]),
+                        "rollout/resolved": int(bool(episode["resolved"])),
+                        "rollout/scenario_index": scenario_index,
+                        "rollout/valid_action_rate": float(episode["valid_action_rate"]),
+                        "rollout/valid_actions": int(episode["valid_actions"]),
+                        "rollout/total_actions": int(episode["total_actions"]),
+                        "rollout/completion_tokens": int(episode["completion_tokens"]),
+                        "rollout/prompt_tokens": int(episode["prompt_tokens"]),
+                        f"rollout/scenario_reward/{episode['scenario']}": float(episode["total_reward"]),
+                        f"rollout/scenario_count/{episode['scenario']}": len(scenario_rewards[episode["scenario"]]),
+                        "running/mean_reward": running_mean(recent_rewards, roll_window),
+                        "running/resolution_rate": running_mean(
+                            [float(v) for v in recent_resolved], roll_window
+                        ),
+                        "running/mean_steps": running_mean([float(v) for v in recent_steps], roll_window),
+                        "running/valid_action_rate": running_mean(recent_valid_rate, roll_window),
+                        "rollout/cumulative_resolved": int(sum(recent_resolved)),
+                        "rollout/cumulative_episodes": episode_counter["value"],
+                    }
+                    for tool_name, count in tool_usage.items():
+                        log_payload[f"tool_usage/{tool_name}"] = int(count)
+
+                    with _wandb_guard("log"):
+                        wandb.log(log_payload)
+
+                    if episode_table is not None:
+                        with _wandb_guard("Table.add_data"):
+                            episode_table.add_data(
+                                episode_counter["value"],
+                                episode["scenario"],
+                                float(episode["total_reward"]),
+                                float(episode["mean_step_reward"]),
+                                float(episode["min_step_reward"]),
+                                float(episode["max_step_reward"]),
+                                int(episode["steps"]),
+                                bool(episode["resolved"]),
+                                float(episode["valid_action_rate"]),
+                                int(episode["completion_tokens"]),
+                                int(episode["prompt_tokens"]),
+                                float(episode["mean_logprob"]),
+                                top_tool,
+                                episode.get("sample_completion", ""),
+                            )
+
         return {
             "prompt_ids": episode_prompt_ids,
             "completion_ids": episode_completion_ids,
@@ -644,6 +1140,9 @@ def main() -> None:
             "scenario": scenario_names,
             "resolved": resolved_flags,
         }
+
+    # ----------- trainer init -----------------------------------------------
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
     trainer = GRPOTrainer(
         model=model,
@@ -656,26 +1155,118 @@ def main() -> None:
         peft_config=peft_config,
     )
 
-    trainer.train()
+    if _WANDB_STATE["broken"] or wandb is None:
+        _strip_wandb_callback(trainer)
+    else:
+        for method in (
+            "on_init_end", "on_train_begin", "on_log", "on_save",
+            "on_evaluate", "on_predict", "on_train_end",
+        ):
+            _wrap_callback_method(trainer, method)
 
-    adapter_dir = output_dir / "adapter"
+    # ----------- train ------------------------------------------------------
+    try:
+        trainer.train()
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        if "wandb" in msg.lower() and not _WANDB_STATE["broken"]:
+            print(f"[wandb] training raised {msg}; disabling wandb and resuming.")
+            _WANDB_STATE["broken"] = True
+            _strip_wandb_callback(trainer)
+            os.environ["WANDB_DISABLED"] = "true"
+            if hasattr(trainer, "args") and getattr(trainer.args, "report_to", None):
+                trainer.args.report_to = [r for r in trainer.args.report_to if r != "wandb"]
+            _safe_wandb_finish()
+            trainer.train()
+        else:
+            raise
+
+    # ----------- artifacts + plots ------------------------------------------
+    adapter_dir = OUTPUT_DIR / "adapter"
     trainer.save_model(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
 
-    plot_rewards(reward_log_path, output_dir / "reward_plot.png")
+    reward_plot_path = OUTPUT_DIR / "reward_plot.png"
+    trainer_metrics_path = OUTPUT_DIR / "trainer_metrics.png"
+    log_history_path = OUTPUT_DIR / "trainer_log_history.csv"
+    summary_path = OUTPUT_DIR / "training_summary.json"
+
+    plot_rewards(reward_log_path, reward_plot_path)
     log_history = pd.DataFrame(trainer.state.log_history)
-    log_history.to_csv(output_dir / "trainer_log_history.csv", index=False)
-    plot_trainer_metrics(log_history, output_dir / "trainer_metrics.png")
+    log_history.to_csv(log_history_path, index=False)
+    plot_trainer_metrics(log_history, trainer_metrics_path)
+
     summary = {
-        "model_id": args.model_id,
-        "env_url": args.env_url,
-        "train_episodes": args.train_episodes,
-        "eval_episodes": args.eval_episodes,
-        "num_generations": args.num_generations,
-        "output_dir": str(output_dir),
+        "model_id": MODEL_ID,
+        "env_url": ENV_URL,
+        "train_episodes": TRAIN_EPISODES,
+        "eval_episodes": EVAL_EPISODES,
+        "num_generations": NUM_GENERATIONS,
+        "num_epochs": NUM_EPOCHS,
+        "output_dir": str(OUTPUT_DIR),
         "adapter_dir": str(adapter_dir),
     }
-    (output_dir / "training_summary.json").write_text(json.dumps(summary, indent=2))
+    wandb_run_url = None
+    if _wandb_active():
+        try:
+            wandb_run_url = wandb.run.url
+        except Exception:
+            wandb_run_url = None
+    summary["wandb_run_url"] = wandb_run_url
+    summary_path.write_text(json.dumps(summary, indent=2))
+    print("Wrote artifacts under", OUTPUT_DIR.resolve())
+
+    if _wandb_active():
+        if reward_plot_path.exists():
+            with _wandb_guard("log reward_curve"):
+                wandb.log({"plots/reward_curve": wandb.Image(str(reward_plot_path))})
+        if trainer_metrics_path.exists():
+            with _wandb_guard("log trainer_metrics"):
+                wandb.log({"plots/trainer_metrics": wandb.Image(str(trainer_metrics_path))})
+        if episode_table is not None:
+            with _wandb_guard("log episode_table"):
+                wandb.log({"rollout/episode_table": episode_table})
+
+        run_artifact = None
+        with _wandb_guard("Artifact run"):
+            run_artifact = wandb.Artifact("kubemedic-grpo-run", type="training-output")
+            for path in (
+                reward_log_path, log_history_path, summary_path,
+                reward_plot_path, trainer_metrics_path, transcript_path,
+            ):
+                if path.exists():
+                    run_artifact.add_file(str(path))
+        if run_artifact is not None:
+            with _wandb_guard("log_artifact run"):
+                wandb.log_artifact(run_artifact)
+
+        if adapter_dir.exists():
+            adapter_artifact = None
+            with _wandb_guard("Artifact adapter"):
+                adapter_artifact = wandb.Artifact(
+                    "kubemedic-grpo-adapter",
+                    type="model",
+                    metadata={"base_model": MODEL_ID, "kind": "lora"},
+                )
+                adapter_artifact.add_dir(str(adapter_dir))
+            if adapter_artifact is not None:
+                with _wandb_guard("log_artifact adapter"):
+                    wandb.log_artifact(adapter_artifact)
+
+        with _wandb_guard("finish"):
+            wandb.finish()
+        print("wandb run finished (artifact upload best-effort).")
+    else:
+        print("wandb not active; skipping wandb artifact upload.")
+
+    # ----------- final result echo (cell 20) --------------------------------
+    print("\n=== Final results ===")
+    if reward_log_path.exists():
+        print(pd.read_csv(reward_log_path).tail(10).to_string(index=False))
+    print(json.dumps(summary, indent=2))
+    print("Reward plot   :", reward_plot_path)
+    print("Trainer plot  :", trainer_metrics_path)
+    print("Adapter dir   :", adapter_dir)
 
 
 if __name__ == "__main__":
