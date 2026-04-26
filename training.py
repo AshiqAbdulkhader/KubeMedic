@@ -151,7 +151,11 @@ from packaging.version import Version  # noqa: E402
 from peft import LoraConfig  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig  # noqa: E402
 from trl import GRPOConfig, GRPOTrainer  # noqa: E402
-from trl.experimental.openenv import generate_rollout_completions  # noqa: E402
+
+try:
+    from trl.experimental.openenv import generate_rollout_completions  # noqa: E402
+except ImportError:
+    generate_rollout_completions = None  # noqa: E402 — set after local def in main
 
 from Kubemedic import KubemedicAction, KubemedicEnv, KubemedicObservation  # noqa: E402
 from Kubemedic.models import ToolName  # noqa: E402
@@ -489,6 +493,18 @@ def generate_rollout_completions_local(trainer: GRPOTrainer, prompts: list[str])
             }
         )
     return results
+
+
+if generate_rollout_completions is None:
+    generate_rollout_completions = generate_rollout_completions_local
+    if USE_VLLM:
+        import warnings
+
+        warnings.warn(
+            "trl.experimental.openenv is not installed: vLLM rollouts will use local HF `model.generate` "
+            "instead. Install a trl build that provides trl.experimental.openenv, or set USE_VLLM=False.",
+            stacklevel=1,
+        )
 
 
 def rollout_once(
