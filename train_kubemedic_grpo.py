@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
 import sys
 import threading
@@ -34,6 +35,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 
 from Kubemedic import KubemedicAction, KubemedicEnv
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional runtime dependency path
+    load_dotenv = None
 
 try:
     from websockets.exceptions import ConnectionClosedError
@@ -164,6 +170,12 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def load_hf_token_from_env() -> str | None:
+    if load_dotenv is not None:
+        load_dotenv(ROOT / ".env")
+    return os.environ.get("HF_TOKEN")
 
 
 def format_observation(obs) -> str:
@@ -596,11 +608,16 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    hf_token = load_hf_token_from_env()
     seed_everything(args.seed)
     sns.set_theme(style="whitegrid")
     pd.set_option("display.max_colwidth", 120)
 
     env_url = resolve_env_url(args)
+    if hf_token:
+        print("Loaded HF_TOKEN from .env or environment.")
+    else:
+        print("HF_TOKEN not found in .env or environment; relying on existing Hugging Face auth.")
     if not args.skip_smoke_test:
         run_smoke_test(env_url=env_url, scenario="KUBE-03")
     if args.smoke_only:
