@@ -49,7 +49,7 @@ app = create_app(
     KubemedicAction,
     KubemedicObservation,
     env_name="Kubemedic",
-    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
+    max_concurrent_envs=4,  # supports GRPO rollouts with multiple concurrent WebSocket sessions
 )
 
 
