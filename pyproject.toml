@@ -20,7 +20,7 @@ dependencies = [
     # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
     # install from github
     # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
-    "openai>=2.32.0",
+    "openai>=1.99.1,<2.25.0",
     "openenv-core[core]>=0.2.2",
     # Environment-specific dependencies
     # Add all dependencies needed for your environment here
@@ -39,11 +39,27 @@ dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
 ]
+train = [
+    "trl[vllm]>=0.29.0",
+    "vllm>=0.11.0",
+    "transformers>=4.56.0,<5",
+    "accelerate>=0.34.0",
+    "peft>=0.13.0",
+    "datasets>=2.21.0",
+    "bitsandbytes>=0.43.0",
+    "huggingface_hub>=0.20.0",
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+    "pandas>=2.2.0",
+    "ipywidgets>=8.1.0",
+    "jmespath>=1.0.1",
+]
 
 [project.scripts]
 # Server entry point - enables running via: uv run --project . server
 # or: python -m Kubemedic.server.app
 server = "Kubemedic.server.app:main"
+train-kubemedic-grpo = "Kubemedic.training:main"
 
 [tool.setuptools]
 include-package-data = true
